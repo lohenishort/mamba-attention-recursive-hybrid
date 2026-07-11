@@ -215,7 +215,7 @@ def main() -> None:
 
     # Save checkpoint
     os.makedirs("data", exist_ok=True)
-    torch.save(model.state_dict(), "data/unified_model.pt")
+    torch.save({"state_dict": model.state_dict(), "config": vars(config)}, "data/unified_model.pt")
     print(
         "\nSuccessfully saved trained Unified Multi-Task model to data/unified_model.pt"
     )

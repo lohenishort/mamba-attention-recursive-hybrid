@@ -27,21 +27,29 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading Multi-Task Evaluation Environment on {device}...")
 
-    # Load state dict first to infer configuration parameters dynamically
-    state_dict = torch.load(model_path, map_location=device)
-    d_model = state_dict["embed.weight"].shape[1]
-    n_meta = state_dict["reasoning_encoder.M_meta"].shape[1]
-
-    # Configuration
-    l_ans = 32
-    max_seq_len = 128
-    config = MambaHybridConfig(
-        d_model=d_model, n_meta=n_meta, l_ans=l_ans, n_steps=4, t_cycles=3
-    )
+    # Load checkpoint and extract config / state_dict
+    checkpoint = torch.load(model_path, map_location=device)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint and "config" in checkpoint:
+        config_dict = checkpoint["config"]
+        config = MambaHybridConfig(
+            d_model=config_dict.get("d_model", 64),
+            n_meta=config_dict.get("n_meta", 16),
+            l_ans=config_dict.get("l_ans", 32),
+            n_steps=config_dict.get("n_steps", 2),
+            t_cycles=config_dict.get("t_cycles", 2)
+        )
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+        d_model = state_dict["embed.weight"].shape[1]
+        n_meta = state_dict["reasoning_encoder.M_meta"].shape[1]
+        config = MambaHybridConfig(
+            d_model=d_model, n_meta=n_meta, l_ans=32, n_steps=2, t_cycles=2
+        )
 
     # Load dataset
     dataset = MultiTaskDataset(
-        data_dir, max_seq_len=max_seq_len, l_ans=l_ans, max_samples_per_task=10
+        data_dir, max_seq_len=128, l_ans=config.l_ans, max_samples_per_task=10
     )
 
     # Load model
