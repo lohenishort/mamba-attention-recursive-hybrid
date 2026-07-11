@@ -70,8 +70,6 @@ class MambaAttentionHybrid(nn.Module):
             z, y = self.planning_loop(X_raw, z, y, warmup=True)
 
         # Supervision cycle (T cycle, grad enabled)
-        z = z.detach().requires_grad_(True)  # [batch_size, n_meta, d_model]
-        y = y.detach().requires_grad_(True)  # [batch_size, l_ans, d_model]
 
         bce_probs: list[torch.Tensor] = []
         for i in range(1, self.n_steps + 1):
