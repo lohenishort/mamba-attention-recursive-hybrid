@@ -32,7 +32,7 @@ def compute_bce_joint_loss(
     # Each prob in bce_probs: [batch_size]
 
     B, L_ans, D = y_final.shape
-    loss_task = F.cross_entropy(y_final.view(-1, D), target_ids.view(-1))
+    loss_task = F.cross_entropy(y_final.view(-1, D), target_ids.view(-1), ignore_index=0)
 
     loss_bce = torch.tensor(0.0, device=y_final.device)
     n_steps = len(bce_probs)
@@ -82,7 +82,7 @@ def compute_q_joint_loss(
     # correct_mask: [batch_size]
     # Each pred in q_preds: [batch_size, 2]
     B, L_ans, D = y_final.shape
-    loss_task = F.cross_entropy(y_final.view(-1, D), target_ids.view(-1))
+    loss_task = F.cross_entropy(y_final.view(-1, D), target_ids.view(-1), ignore_index=0)
 
     loss_q = torch.tensor(0.0, device=y_final.device)
     n_steps = len(q_preds)
