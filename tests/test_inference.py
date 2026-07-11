@@ -1,0 +1,119 @@
+import torch
+from unittest.mock import patch
+from mamba_hybrid.config import MambaHybridConfig
+from mamba_hybrid.model import MambaAttentionHybrid
+from mamba_hybrid.inference import ptrm_inference
+
+
+def test_ptrm_runs() -> None:
+    """Verifies that the ptrm_inference function runs and returns the expected shape."""
+    config: MambaHybridConfig = MambaHybridConfig(d_model=64, n_meta=16, l_ans=8)
+    model: MambaAttentionHybrid = MambaAttentionHybrid(config)
+    model.eval()
+    x: torch.Tensor = torch.randn(2, 32, 64)  # [batch_size, seq_len, d_model]
+    out: torch.Tensor = ptrm_inference(x, model, K=3, sigma_base=0.01)
+    # Expected shape: [batch_size, l_ans, d_model]
+    assert out.shape == (2, 8, 64)
+
+
+def test_ptrm_k_equals_1() -> None:
+    """Verifies that when K = 1, ptrm_inference falls back to the default forward pass."""
+    config: MambaHybridConfig = MambaHybridConfig(d_model=32, n_meta=8, l_ans=4)
+    model: MambaAttentionHybrid = MambaAttentionHybrid(config)
+    model.eval()
+    x: torch.Tensor = torch.randn(2, 10, 32)  # [batch_size, seq_len, d_model]
+    out1: torch.Tensor = ptrm_inference(x, model, K=1)
+
+    with torch.no_grad():
+        out2: torch.Tensor
+        out2, _ = model(x)
+
+    assert torch.allclose(out1, out2)
+
+
+def test_ptrm_consensus_selection() -> None:
+    """Verifies consensus majority selection and Q-score routing across candidates."""
+    # Set up config
+    config: MambaHybridConfig = MambaHybridConfig(
+        d_model=64, n_meta=16, l_ans=8, t_cycles=1, n_steps=2
+    )
+    model: MambaAttentionHybrid = MambaAttentionHybrid(config)
+    model.eval()
+
+    # We want K = 3 rollouts
+    # Candidates for Batch 0:
+    # k = 0: Candidate A (sum = 10.0), score = 0.8
+    # k = 1: Candidate B (sum = 20.0), score = 0.9
+    # k = 2: Candidate A (sum = 10.0), score = 0.7
+    # Expected output: Candidate A with score 0.8 (since A is the majority group, and 0.8 > 0.7)
+
+    # Candidates for Batch 1:
+    # k = 0: Candidate C (sum = 30.0), score = 0.4
+    # k = 1: Candidate D (sum = 40.0), score = 0.6
+    # k = 2: Candidate D (sum = 40.0), score = 0.5
+    # Expected output: Candidate D with score 0.6 (majority group D, and 0.6 > 0.5)
+
+    B: int = 2
+    L_ans: int = 8
+    D: int = 64
+
+    cand_A: torch.Tensor = torch.zeros(L_ans, D)
+    cand_A[0, 0] = 10.0
+
+    cand_B: torch.Tensor = torch.zeros(L_ans, D)
+    cand_B[0, 0] = 20.0
+
+    cand_C: torch.Tensor = torch.zeros(L_ans, D)
+    cand_C[0, 0] = 30.0
+
+    cand_D: torch.Tensor = torch.zeros(L_ans, D)
+    cand_D[0, 0] = 40.0
+
+    # Stack for batch size 2:
+    # rollout 0: [cand_A, cand_C]
+    # rollout 1: [cand_B, cand_D]
+    # rollout 2: [cand_A, cand_D]
+    rollout_cands: list[torch.Tensor] = [
+        torch.stack([cand_A, cand_C], dim=0),
+        torch.stack([cand_B, cand_D], dim=0),
+        torch.stack([cand_A, cand_D], dim=0),
+    ]
+
+    # scores:
+    # rollout 0: [0.8, 0.4]
+    # rollout 1: [0.9, 0.6]
+    # rollout 2: [0.7, 0.5]
+    rollout_scores: list[torch.Tensor] = [
+        torch.tensor([0.8, 0.4]),
+        torch.tensor([0.9, 0.6]),
+        torch.tensor([0.7, 0.5]),
+    ]
+
+    call_count: int = 0
+
+    def mock_answer_update(z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        nonlocal call_count
+        res: torch.Tensor = rollout_cands[call_count]
+        call_count += 1
+        return res
+
+    def mock_q_head(z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        idx: int = call_count - 1
+        return rollout_scores[idx]
+
+    with (
+        patch.object(
+            model.planning_loop.answer_update_block,
+            "forward",
+            side_effect=mock_answer_update,
+        ),
+        patch.object(model.q_head, "forward", side_effect=mock_q_head),
+    ):
+        x: torch.Tensor = torch.randn(B, 16, D)
+        out: torch.Tensor = ptrm_inference(x, model, K=3, sigma_base=0.01)
+
+    assert out.shape == (2, L_ans, D)
+    # Check Batch 0 is cand_A (sum 10.0)
+    assert torch.allclose(out[0], cand_A)
+    # Check Batch 1 is cand_D (sum 40.0)
+    assert torch.allclose(out[1], cand_D)
