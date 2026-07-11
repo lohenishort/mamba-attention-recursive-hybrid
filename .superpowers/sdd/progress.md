@@ -9,6 +9,6 @@
 - [x] Task 7: BCE Halting Head
 - [x] Task 8: End-to-End Forward Pass
 - [x] Task 9: Training Losses (Sparse Task + BCE Halting Loss)
-- [ ] Task 10: Q-Learning Halting Extension
+- [x] Task 10: Q-Learning Halting Extension
 - [ ] Task 11: PTRM Inference & Consensus-Augmented Selection
 - [ ] Task 12: Integration Tests and Linters
