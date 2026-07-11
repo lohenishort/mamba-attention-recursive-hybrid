@@ -1,3 +1,5 @@
+import contextlib
+
 import torch
 import torch.nn as nn
 from mamba_hybrid.config import MambaHybridConfig
@@ -45,7 +47,7 @@ class PlanningLoop(nn.Module):
         # [batch_size, seq_len, d_model]
         # z: [batch_size, n_meta, d_model]
         # y: [batch_size, l_ans, d_model]
-        context_manager = torch.no_grad() if warmup else torch.enable_grad()
+        context_manager = torch.no_grad() if warmup else contextlib.nullcontext()
         with context_manager:
             # Run one complete cycle (n latent updates + 1 answer update)
             for _ in range(1, self.n_steps + 1):
