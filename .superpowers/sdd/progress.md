@@ -1,7 +1,7 @@
 # Mamba-Attention Hybrid Progress Ledger
 
 - [x] Task 1: Environment Scaffolding and Configurations
-- [ ] Task 2: Attention Branch with Prefix-Causal Masking
+- [x] Task 2: Attention Branch with Prefix-Causal Masking
 - [ ] Task 3: Pure PyTorch SSM (Structured State Duality) Backend
 - [ ] Task 4: Hybrid Fusion Block
 - [ ] Task 5: Answer Update Block
