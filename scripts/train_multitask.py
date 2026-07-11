@@ -26,11 +26,15 @@ def tokenize_string(s: str, max_len: int) -> List[int]:
 
 
 # --- 1. Multi-Task Dataset Loader ---
-class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
+class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, str]]):
     def __init__(
-        self, data_dir: str, max_seq_len: int = 128, l_ans: int = 32, max_samples_per_task: int = 100
+        self,
+        data_dir: str,
+        max_seq_len: int = 128,
+        l_ans: int = 128,
+        max_samples_per_task: int = 100,
     ) -> None:
-        self.samples: List[Tuple[str, str]] = []
+        self.samples: List[Tuple[str, str, str]] = []
         self.max_seq_len = max_seq_len
         self.l_ans = l_ans
 
@@ -42,7 +46,7 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
                 grid_str = "".join(str(int(val)) for row in s["grid"] for val in row)
                 inp = f"MAZE: {grid_str}"
                 tgt = "PATH: " + " ".join(f"({r},{c})" for r, c in s["path"])
-                self.samples.append((inp, tgt))
+                self.samples.append((inp, tgt, "MAZE"))
 
         # 2. Sudoku
         sudoku_path = os.path.join(data_dir, "sudoku.jsonl")
@@ -55,7 +59,7 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
                     inp = f"SUDOKU: {grid_str}"
                     sol_str = "".join(str(val) for row in s["solution"] for val in row)
                     tgt = f"SOL: {sol_str}"
-                    self.samples.append((inp, tgt))
+                    self.samples.append((inp, tgt, "SUDOKU"))
                     count += 1
                     if count >= max_samples_per_task:
                         break
@@ -73,7 +77,7 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
                             edges.append(f"{i}->{j}:{adj[i][j]:.1f}")
                 inp = "DIJKSTRA: " + ",".join(edges)
                 tgt = "DIST: " + " ".join(f"{d:.1f}" for d in s["distances"])
-                self.samples.append((inp, tgt))
+                self.samples.append((inp, tgt, "DIJKSTRA"))
 
         # 4. GSM8K
         gsm8k_path = os.path.join(data_dir, "gsm8k_train.jsonl")
@@ -84,7 +88,7 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
                     s = json.loads(line)
                     inp = f"GSM8K: {s['question']}"
                     tgt = f"ANS: {s['answer']}"
-                    self.samples.append((inp, tgt))
+                    self.samples.append((inp, tgt, "GSM8K"))
                     count += 1
                     if count >= max_samples_per_task:
                         break
@@ -92,31 +96,52 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        inp_str, tgt_str = self.samples[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        inp_str, tgt_str, task_name = self.samples[idx]
         inp_tokens = tokenize_string(inp_str, self.max_seq_len)
         tgt_tokens = tokenize_string(tgt_str, self.l_ans)
-        return torch.tensor(inp_tokens, dtype=torch.long), torch.tensor(
-            tgt_tokens, dtype=torch.long
+        return (
+            torch.tensor(inp_tokens, dtype=torch.long),
+            torch.tensor(tgt_tokens, dtype=torch.long),
+            task_name,
         )
 
 
-# --- 2. Unified Reasoning LLM Model ---
+# --- 2. Unified Reasoning LLM Model with Task-Specific Heads ---
 class UnifiedReasoningLLM(nn.Module):
     def __init__(self, config: MambaHybridConfig, vocab_size: int = 128) -> None:
         super().__init__()
         self.config = config
         self.embed = nn.Embedding(vocab_size, config.d_model)
         self.reasoning_encoder = MambaAttentionHybrid(config)
-        self.token_generator = nn.Linear(config.d_model, vocab_size)
+
+        # Task-specific projection heads to prevent multi-task representation interference
+        self.heads = nn.ModuleDict(
+            {
+                "MAZE": nn.Linear(config.d_model, vocab_size),
+                "SUDOKU": nn.Linear(config.d_model, vocab_size),
+                "DIJKSTRA": nn.Linear(config.d_model, vocab_size),
+                "GSM8K": nn.Linear(config.d_model, vocab_size),
+            }
+        )
 
     def forward(
-        self, input_ids: torch.Tensor
+        self, input_ids: torch.Tensor, task_names: List[str]
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         # input_ids shape: [B, L_raw]
+        B = input_ids.shape[0]
         X_raw = self.embed(input_ids)  # [B, L_raw, D]
         y_final, bce_probs = self.reasoning_encoder(X_raw)  # [B, l_ans, D]
-        logits = self.token_generator(y_final)  # [B, l_ans, vocab_size]
+
+        # Route each sample in the batch to its respective task-specific head
+        logits_list = []
+        for i in range(B):
+            task = task_names[i]
+            # y_final[i] shape: [l_ans, D]
+            logits_sample = self.heads[task](y_final[i])  # [l_ans, vocab_size]
+            logits_list.append(logits_sample)
+
+        logits = torch.stack(logits_list, dim=0)  # [B, l_ans, vocab_size]
         return logits, bce_probs
 
 
@@ -127,14 +152,16 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Set up config
-    l_ans = 32
+    # Set up config with max answer length (128 for GSM8K)
+    l_ans = 128
     config = MambaHybridConfig(
         d_model=64, n_meta=16, l_ans=l_ans, n_steps=2, t_cycles=2
     )
 
     # Initialize Dataset (load 100 samples per task to train fast on CPU)
-    dataset = MultiTaskDataset(data_dir, max_seq_len=128, l_ans=l_ans, max_samples_per_task=100)
+    dataset = MultiTaskDataset(
+        data_dir, max_seq_len=128, l_ans=l_ans, max_samples_per_task=100
+    )
     if len(dataset) == 0:
         print(
             "Error: No datasets found in data/ directory. Please run scripts.download_all_datasets first."
@@ -162,11 +189,11 @@ def main() -> None:
         correct_count = 0
         total_samples = 0
 
-        for input_ids, target_ids in train_loader:
+        for input_ids, target_ids, task_names in train_loader:
             input_ids, target_ids = input_ids.to(device), target_ids.to(device)
             optimizer.zero_grad()
 
-            logits, bce_probs = model(input_ids)
+            logits, bce_probs = model(input_ids, task_names)
 
             # Accuracy on non-padding tokens
             preds = logits.argmax(dim=-1)
@@ -193,9 +220,9 @@ def main() -> None:
         val_correct = 0
         val_samples = 0
         with torch.no_grad():
-            for input_ids, target_ids in val_loader:
+            for input_ids, target_ids, task_names in val_loader:
                 input_ids, target_ids = input_ids.to(device), target_ids.to(device)
-                logits, bce_probs = model(input_ids)
+                logits, bce_probs = model(input_ids, task_names)
                 preds = logits.argmax(dim=-1)
                 is_correct = (preds == target_ids).all(dim=-1)
                 loss = compute_bce_joint_loss(
@@ -215,7 +242,10 @@ def main() -> None:
 
     # Save checkpoint
     os.makedirs("data", exist_ok=True)
-    torch.save({"state_dict": model.state_dict(), "config": vars(config)}, "data/unified_model.pt")
+    torch.save(
+        {"state_dict": model.state_dict(), "config": vars(config)},
+        "data/unified_model.pt",
+    )
     print(
         "\nSuccessfully saved trained Unified Multi-Task model to data/unified_model.pt"
     )
