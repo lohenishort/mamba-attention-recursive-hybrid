@@ -30,7 +30,14 @@ To minimize layer complexity and memory bandwidth, a single fused projection pro
 ### 1.3 Parallel Execution Paths
 1. **Attention Path:**
    $$Y_{\text{attn}} = \text{MultiHeadAttention}(Q, K, V) \in \mathbb{R}^{B \times L \times D}$$
-   *Attention is non-causal (bidirectional) during the latent planning phase, and causal during the autoregressive generation phase.*
+   * **Latent Planning Phase:** Attention is fully bidirectional (non-causal).
+   * **Autoregressive Generation Phase:** Attention utilizes a **Prefix-Causal Mask**. Let $i$ and $j$ be indices in the range $[1, N_{\text{meta}} + L_{\text{gen}}]$. The mask matrix $M$ is defined as:
+     $$M_{ij} = \begin{cases} 
+     1 & \text{if } i \le N_{\text{meta}} \text{ and } j \le N_{\text{meta}} \quad \text{(Bidirectional meta-tokens)} \\
+     1 & \text{if } i > N_{\text{meta}} \text{ and } j \le N_{\text{meta}} \quad \text{(Generated tokens attend to meta-tokens)} \\
+     1 & \text{if } i > N_{\text{meta}}, j > N_{\text{meta}}, \text{ and } i \ge j \quad \text{(Causal attention for generation)} \\
+     0 & \text{otherwise}
+     \end{cases}$$
 2. **Mamba-2 / SSD Path:**
    $$Y_{\text{ssm}} = \text{Mamba2SSDScan}(X_{\text{ssm}}, G_{\text{ssm}}, B, C, \Delta) \in \mathbb{R}^{B \times L \times D}$$
    *Uses pure PyTorch tensor operations as a default fallback for CPU/GPU portability, routing to official CUDA kernels if toggled.*
@@ -63,8 +70,12 @@ The planning process consists of $T$ cycles. Each cycle $c \in [1, T]$ contains:
    $$\tilde{H}_i = \text{PlanningBlock}(\tilde{X}_i)$$
    $$z_i = \tilde{H}_i[:, :N_{\text{meta}}, :] \in \mathbb{R}^{B \times N_{\text{meta}} \times D}$$
    *Attention is non-causal here to propagate constraints globally.*
-2. **1 Answer Update Step:** The answer state is updated at the end of cycle $c$ **without** direct access to $X_{\text{raw}}$:
+2. **1 Answer Update Step (Cross-Attention Block):** The answer state is updated at the end of cycle $c$ using cross-attention, preventing direct access to $X_{\text{raw}}$:
    $$y_c = \text{AnswerUpdateBlock}(z_n, y_{c-1}) \in \mathbb{R}^{B \times L_{\text{ans}} \times D}$$
+   where:
+   * Queries ($Q_y$): Projected from $y_{c-1} \in \mathbb{R}^{B \times L_{\text{ans}} \times D}$
+   * Keys ($K_z$) & Values ($V_z$): Projected from $z_n \in \mathbb{R}^{B \times N_{\text{meta}} \times D}$
+   * Output: $y_c = \text{Softmax}\left(\frac{Q_y K_z^T}{\sqrt{D}}\right) V_z \quad$ (followed by residual connection and projection)
 
 ### 2.3 Warmup vs. Gradient Phase
 * **Warmup Cycles ($c \in [1, T-1]$):** Evaluated under `torch.no_grad()` to propagate states without storing activation graphs.
@@ -76,9 +87,15 @@ The planning process consists of $T$ cycles. Each cycle $c \in [1, T]$ contains:
 
 Adaptive Computation Time (ACT) decides when to stop planning. We support two configurable heads.
 
-### 3.1 Mode A: Q-Learning Head (Temporal Credit Assignment)
-We define a Q-network $f_Q(z_t, y_t) \rightarrow \mathbb{R}^2$ outputting values for $a \in \{\text{continue}, \text{halt}\}$:
-$$[Q(s_t, \text{continue}), Q(s_t, \text{halt})] = \text{Linear}(\text{ReLU}(\text{Linear}(\text{Concat}(z_t, y_t))))$$
+### 3.1 Sequence Representation Pooling
+To produce sequence-level halting decisions from token-level representations, both ACT heads apply global average pooling across the sequence dimension of the combined state:
+$$s_t = \text{GlobalAveragePool}\left(\text{Concat}(z_t, y_t)\right) \in \mathbb{R}^{B \times D}$$
+
+---
+
+### 3.2 Mode A: Q-Learning Head (Temporal Credit Assignment)
+We define a Q-network $f_Q(s_t) \rightarrow \mathbb{R}^2$ outputting values for $a \in \{\text{continue}, \text{halt}\}$:
+$$[Q(s_t, \text{continue}), Q(s_t, \text{halt})] = \text{Linear}(\text{ReLU}(\text{Linear}(s_t)))$$
 
 * **1-Step Bootstrapped Q-Targets:**
   * **Halt Target:** $Q^*(s_t, \text{halt}) = R_t = \mathbb{I}(\hat{y}_t == Y_{\text{target}})$
@@ -90,15 +107,23 @@ $$[Q(s_t, \text{continue}), Q(s_t, \text{halt})] = \text{Linear}(\text{ReLU}(\te
 * **Loss Function:**
   $$\mathcal{L}_{\text{Q}} = \frac{1}{m} \sum_{t=1}^{m} \Big[ \lambda_t^{\text{cont}} \left( Q(s_t, \text{continue}) - Q^*(s_t, \text{continue}) \right)^2 + \lambda_t^{\text{halt}} \left( Q(s_t, \text{halt}) - Q^*(s_t, \text{halt}) \right)^2 \Big]$$
 
-### 3.2 Mode B: BCE Halting Classifier (Static Correctness Classifier)
-Predicts halting probability $p_t = \sigma(\text{Linear}(\text{Concat}(z_t, y_t)))$ with targets $p_t^* = 1.0$ if the prediction $\hat{y}_t$ is correct, else $0.0$.
+---
+
+### 3.3 Mode B: BCE Halting Classifier (Static Correctness Classifier)
+Predicts halting probability $p_t = \sigma(\text{Linear}(s_t))$ with targets $p_t^* = 1.0$ if the prediction $\hat{y}_t$ is correct, else $0.0$.
 $$\mathcal{L}_{\text{BCE}} = -\frac{1}{m} \sum_{t=1}^{m} \left( p_t^* \log(p_t) + (1 - p_t^*) \log(1 - p_t) \right)$$
 
-### 3.3 Training Safeguards
+---
+
+### 3.4 Training Safeguards & Noise Regularization
 * **Negative Bias Initialization:** Halting logits are initialized with bias **$-5.0$** (halting probability $\approx 0.007$) to force exploration during early training.
 * **Randomized $M_{\text{min}}$:** During training, $M_{\text{min}} \sim \text{Uniform}(1, M_{\text{max}})$ is sampled per batch. The model is forced to continue until $t \ge M_{\text{min}}$.
+* **Training-Time Noise Regularization:** To prevent distribution shift and calibrate the halting heads on perturbed states, we introduce training-time noise injection. With probability $p_{\text{noise\_train}} = 0.15$ during the supervision cycle, noise is injected into the latent state $z_i$:
+  $$z_{i,\text{noisy}}^{\text{train}} = z_i + \epsilon_i \quad \text{where } \epsilon_i \sim \mathcal{N}(0, \eta \cdot \sigma_{\text{base}}^2 I) \text{ and } \eta \sim \text{Uniform}(0, 0.5)$$
 
-### 3.4 Sparse Supervision Loss
+---
+
+### 3.5 Sparse Supervision Loss
 Task cross-entropy loss is applied sparsely, only at the final step of cycle $T$:
 $$\mathcal{L}_{\text{task}} = \text{CrossEntropy}(\text{Decode}(y_T), Y_{\text{target}})$$
 Intermediate states $y_c$ ($c < T$) and $z$ receive no direct task loss.
@@ -112,7 +137,7 @@ PTRM injects noise into the continuous latent space at inference to explore alte
 ### 4.1 Stochastic Trajectory Generation
 Given $K$ parallel candidate rollouts:
 * **K=1 (Deterministic Baseline):** Noise is bypassed ($\sigma = 0$) for exact reproducibility.
-* **K > 1:** For each rollout $k$, we inject Gaussian noise at each step $i$:
+* **K > 1:** For each rollout $k$, we inject Gaussian noise at each step $i$ of cycle $c$:
   $$z_{i}^{\text{noisy}} = z_{i} + \epsilon_{i} \quad \text{where } \epsilon_{i} \sim \mathcal{N}(0, \sigma_i^2 I)$$
   $$\tilde{X}_i = \text{Concat}(z_i^{\text{noisy}}, y_{c-1}, X_{\text{raw}})$$
   $$z_{i+1} = \text{PlanningBlock}(\tilde{X}_i)[:, :N_{\text{meta}}, :]$$
@@ -120,14 +145,16 @@ Given $K$ parallel candidate rollouts:
 
 ### 4.2 Noise Variance Mitigation
 We support two compatible or independent mitigation settings:
-1. **Noise Annealing (Default):** Noise is scaled down over the $n$ latent steps of each cycle:
+1. **Noise Annealing (Default):** Noise is scaled down over the $n$ latent steps (total latent reasoning steps per cycle) of each cycle:
    $$\sigma_i = \sigma_{\text{base}} \cdot \sqrt{1 - \frac{i}{n}}$$
-2. **`max_noise_step` Limit:** Noise injection is zeroed out for all steps $i > \text{max\_noise\_step}$ to allow final-phase trajectory convergence.
+2. **`max_noise_step` Limit:** Noise injection is zeroed out for all steps $i > \text{max\_noise\_step}$ to allow final-phase trajectory convergence. Both settings can be combined (annealing step-wise until the limit is hit, then hard-zeroing).
+
+---
 
 ### 4.3 Candidate Selection & Consensus Filter
 
 > [!WARNING]
-> **Halting Head Distribution Shift:** The noise injection is strictly **inference-only** (training is done on clean trajectories). Evaluating noisy states introduces a distribution shift. The halting heads may produce uncalibrated or over-confident scores.
+> **Halting Head Distribution Shift:** The noise injection is strictly **inference-only** (training is done on clean trajectories, regularized with minor noise). Evaluating noisy states introduces a distribution shift. The halting heads may produce uncalibrated or over-confident scores.
 
 To mitigate this, the framework defaults to **Policy B** for all $K > 1$.
 
@@ -139,3 +166,8 @@ To mitigate this, the framework defaults to **Policy B** for all $K > 1$.
   3. Select the candidate rollout $k^*$ within the majority group $P_{\text{maj}}$ that has the highest confidence score:
      $$k^* = \arg\max_{k \in P_{\text{maj}}} \text{Score}_k$$
   *If all candidates predict unique answers ($G=K$), the selection falls back to Policy A.*
+
+---
+
+#### 4.4 Computational Complexity Callout
+Running $K$ rollouts increases inference compute cost by $K\times$. Because rollouts are independent, they are batched together along the batch dimension (increasing the effective batch size to $B \cdot K$). This is highly parallelizable on GPUs but increases peak activation memory, representing a direct trade-off between inference-time memory footprint and model accuracy.
