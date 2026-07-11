@@ -9,7 +9,7 @@ This document outlines the architecture, training procedure, and evaluation pipe
 The primary sequence-mixing building block merges transformer self-attention and State Space Model (SSM/Mamba-2) pathways in parallel.
 
 ### 1.1 Meta-Token Prepended Input
-Let $X_{\text{raw}} \in \mathbb{R}^{B \times L_{\text{raw}} \times D}$ be the input problem/context sequence. We define a learnable meta-token parameter matrix $M_{\text{meta}} \in \mathbb{R}^{1 \times N_{\text{meta}} \times D}$, where $N_{\text{meta}}$ is the number of meta-tokens (e.g., 128) and $D$ is the model dimension. 
+Let $X_{\text{raw}} \in \mathbb{R}^{B \times L_{\text{raw}} \times D}$ be the input problem/context sequence of embedded token IDs. We define a learnable meta-token parameter matrix $M_{\text{meta}} \in \mathbb{R}^{1 \times N_{\text{meta}} \times D}$, where $N_{\text{meta}}$ is the number of meta-tokens (e.g., 128) and $D$ is the model dimension. 
 
 Before passing to the hybrid block, the meta-tokens are prepended to the input sequence:
 $$\tilde{X} = \text{Concat}\left(\text{Broadcast}(M_{\text{meta}}, B), X_{\text{raw}}\right) \in \mathbb{R}^{B \times (N_{\text{meta}} + L_{\text{raw}}) \times D}$$
@@ -19,13 +19,14 @@ To minimize layer complexity and memory bandwidth, a single fused projection pro
 * **Attention Projections:**
   $$[Q, K, V] = \tilde{X} W_{\text{attn\_proj}} \quad \text{where } W_{\text{attn\_proj}} \in \mathbb{R}^{D \times 3D}$$
 * **Mamba-2 / SSD Projections:**
-  $$[X_{\text{ssm}}, G_{\text{ssm}}, B, C, \Delta] = \tilde{X} W_{\text{ssm\_proj}}$$
+  $$[X_{\text{ssm}}, G_{\text{ssm}}, H_{\text{in}}, H_{\text{out}}, \Delta] = \tilde{X} W_{\text{ssm\_proj}}$$
   where:
   * Features: $X_{\text{ssm}} \in \mathbb{R}^{B \times L \times (D \cdot E)}$ (expansion factor $E$, typically 2)
   * Gate: $G_{\text{ssm}} \in \mathbb{R}^{B \times L \times (D \cdot E)}$
-  * State Inputs: $B \in \mathbb{R}^{B \times L \times (H \cdot D_{\text{state}})}$ (heads $H$, state size $D_{\text{state}}$, typically 64)
-  * State Outputs: $C \in \mathbb{R}^{B \times L \times (H \cdot D_{\text{state}})}$
+  * State Inputs ($H_{\text{in}}$): $\mathbb{R}^{B \times L \times (H \cdot D_{\text{state}})}$ (heads $H$, state size $D_{\text{state}}$, typically 64)
+  * State Outputs ($H_{\text{out}}$): $\mathbb{R}^{B \times L \times (H \cdot D_{\text{state}})}$
   * Step Sizes: $\Delta \in \mathbb{R}^{B \times L \times H}$
+  *(Note: State matrices are renamed to $H_{\text{in}}, H_{\text{out}}$ to avoid collision with batch size $B$ and key/value projection notation).*
 
 ### 1.3 Parallel Execution Paths
 1. **Attention Path:**
@@ -39,11 +40,11 @@ To minimize layer complexity and memory bandwidth, a single fused projection pro
      0 & \text{otherwise}
      \end{cases}$$
 2. **Mamba-2 / SSD Path:**
-   $$Y_{\text{ssm}} = \text{Mamba2SSDScan}(X_{\text{ssm}}, G_{\text{ssm}}, B, C, \Delta) \in \mathbb{R}^{B \times L \times D}$$
+   $$Y_{\text{ssm}} = \text{Mamba2SSDScan}(X_{\text{ssm}}, G_{\text{ssm}}, H_{\text{in}}, H_{\text{out}}, \Delta) \in \mathbb{R}^{B \times L \times D}$$
    *Uses pure PyTorch tensor operations as a default fallback for CPU/GPU portability, routing to official CUDA kernels if toggled.*
 
 ### 1.4 Scale-Normalized Fusion
-To resolve the magnitude gap between parallel branches, outputs are normalized and scaled using learnable parameters $\beta_1, \beta_2 \in \mathbb{R}^D$:
+To resolve the magnitude gap between parallel branches, outputs are normalized, scaled, and fused:
 $$\begin{aligned}
 \hat{Y}_{\text{attn}} &= \text{RMSNorm}(Y_{\text{attn}}) \\
 \hat{Y}_{\text{ssm}} &= \text{RMSNorm}(Y_{\text{ssm}}) \\
@@ -58,10 +59,12 @@ $$\text{Output} = \tilde{X} + Y_{\text{fused}} W_{\text{out\_proj}} \quad \text{
 
 The planning architecture maintains a strict division of labor between reasoning and answer representation.
 
-### 2.1 Dual-State Representation
+### 2.1 Dual-State Representation & Initialization
 We maintain two distinct recurrent variables:
 * **$z_t \in \mathbb{R}^{B \times N_{\text{meta}} \times D}$ (Latent Reasoning State):** Refines abstract constraints. Initialized as: $z_0 = M_{\text{meta}}$.
-* **$y_t \in \mathbb{R}^{B \times L_{\text{ans}} \times D}$ (Answer State):** Represents the embedding space representation of the current prediction. Initialized as: $y_0 = \text{InitAnswer}(X_{\text{raw}})$.
+* **$y_t \in \mathbb{R}^{B \times L_{\text{ans}} \times D}$ (Answer State):** Represents the embedding space representation of the current prediction. Initialized via $\text{InitAnswer}(X_{\text{raw}})$:
+  $$y_0 = \text{Broadcast}\left(\text{Linear}_{\text{ans}}\left(\text{GlobalAveragePool}(X_{\text{raw}})\right), L_{\text{ans}}\right) \in \mathbb{R}^{B \times L_{\text{ans}} \times D}$$
+  where $L_{\text{ans}}$ is the target answer token length, and $\text{Linear}_{\text{ans}} \in \mathbb{R}^{D \times D}$ is a trainable projection.
 
 ### 2.2 The Cycle Architecture
 The planning process consists of $T$ cycles. Each cycle $c \in [1, T]$ contains:
@@ -123,10 +126,14 @@ $$\mathcal{L}_{\text{BCE}} = -\frac{1}{m} \sum_{t=1}^{m} \left( p_t^* \log(p_t) 
 
 ---
 
-### 3.5 Sparse Supervision Loss
-Task cross-entropy loss is applied sparsely, only at the final step of cycle $T$:
-$$\mathcal{L}_{\text{task}} = \text{CrossEntropy}(\text{Decode}(y_T), Y_{\text{target}})$$
-Intermediate states $y_c$ ($c < T$) and $z$ receive no direct task loss.
+### 3.5 Loss Combination
+We train the model using a joint loss:
+$$\mathcal{L} = \mathcal{L}_{\text{task}} + \alpha \mathcal{L}_{\text{halting}}$$
+where:
+* $\mathcal{L}_{\text{task}} = \text{CrossEntropy}(\text{Decode}(y_T), Y_{\text{target}})$ applied sparsely at cycle $T$.
+* $\mathcal{L}_{\text{halting}} = \mathcal{L}_{\text{Q}}$ (Mode A) or $\mathcal{L}_{\text{BCE}}$ (Mode B).
+* $\alpha \in \mathbb{R}^+$ is a scaling hyperparameter (default $\alpha = 1.0$). 
+* For stability, $s_t$ is detached from the planning backbone during halting loss backpropagation to prevent halting-head optimization from corrupting latent representations.
 
 ---
 
@@ -169,5 +176,151 @@ To mitigate this, the framework defaults to **Policy B** for all $K > 1$.
 
 ---
 
-#### 4.4 Computational Complexity Callout
-Running $K$ rollouts increases inference compute cost by $K\times$. Because rollouts are independent, they are batched together along the batch dimension (increasing the effective batch size to $B \cdot K$). This is highly parallelizable on GPUs but increases peak activation memory, representing a direct trade-off between inference-time memory footprint and model accuracy.
+## 5. Hyperparameter Settings, Training Recipe, and Evaluation
+
+This section details the concrete settings and setup required to reproduce training and evaluation pipelines.
+
+### 5.1 Hyperparameter Specifications
+
+| Hyperparameter | Symbol | Recommended Default | Description |
+| :--- | :--- | :--- | :--- |
+| Model Dimension | $D$ | $512$ | Model embedding and latent dimension |
+| Meta-Tokens Count | $N_{\text{meta}}$ | $128$ | Length of planning prefix |
+| Answer Length | $L_{\text{ans}}$ | $64$ | Output sequence length (depends on task) |
+| Warmup Cycles | $T - 1$ | $4$ | Cycle count evaluated without gradients |
+| Latent Steps / Cycle | $n$ | $6$ | Recurrent steps per cycle |
+| Max Halting Steps | $M_{\text{max}}$ | $35$ | Absolute steps cap: $T \cdot (n+1)$ |
+| Noise Scale base | $\sigma_{\text{base}}$ | $0.05$ | Base standard deviation for PTRM noise |
+
+### 5.2 Training Recipe
+* **Optimizer:** AdamW with $\beta_1 = 0.9, \beta_2 = 0.98$, weight decay $0.01$.
+* **Learning Rate:** Peak learning rate of $1\text{e-}4$, using a linear warmup over the first $10\%$ of steps followed by cosine decay to $1\text{e-}6$.
+* **Batch Size:** $32$ samples.
+* **Gradient Clipping:** Max norm $1.0$ applied to all parameters.
+* **Epochs:** $100,000$ training steps.
+
+### 5.3 Evaluation Metrics
+The framework logs the following metrics during training and evaluation:
+1. **Task Accuracy:** Token-level and sequence-level matching accuracy compared to ground truth targets.
+2. **Average Reasoning Steps:** Mean step count $\bar{m}$ taken by the ACT head before halting.
+3. **Halting Precision / Recall:** Calibration metrics comparing predicted halting positions to the step where accuracy first stabilizes.
+
+---
+
+## 6. Algorithmic Outlines (Pseudocode)
+
+### 6.1 Training Step Pseudocode (Mode A: Q-learning)
+```python
+def train_step(input_ids, target_ids, model, optimizer, target_model, M_max, n, T):
+    optimizer.zero_grad()
+    
+    # 1. Initialization
+    B = input_ids.size(0)
+    X_raw = model.embed(input_ids) # [B, L_raw, D]
+    z = model.M_meta.expand(B, -1, -1) # [B, N_meta, D]
+    y = model.init_answer(X_raw) # [B, Lans, D]
+    
+    # 2. Warmup Cycles (torch.no_grad)
+    with torch.no_grad():
+        for c in range(1, T):
+            for i in range(1, n + 1):
+                X_concat = torch.cat([z, y, X_raw], dim=1)
+                z = model.planning_block(X_concat)[:, :N_meta, :]
+            y = model.answer_update_block(z, y)
+            
+    # 3. Supervision Cycle (Gradients Enabled)
+    z = z.detach().requires_grad_(True)
+    y = y.detach().requires_grad_(True)
+    
+    states, q_preds = [], []
+    M_min = random.randint(1, M_max)
+    
+    # Run final n planning steps with grad
+    for i in range(1, n + 1):
+        X_concat = torch.cat([z, y, X_raw], dim=1)
+        z = model.planning_block(X_concat)[:, :N_meta, :]
+        
+        # Regularization noise
+        if random.random() < 0.15:
+            z = z + torch.randn_like(z) * random.uniform(0, 0.25) * 0.05
+            
+        s_t = pool(z, y)
+        q_pred = model.q_head(s_t)
+        states.append(s_t)
+        q_preds.append(q_pred)
+        
+    y_final = model.answer_update_block(z, y)
+    
+    # 4. Loss Computation
+    loss_task = cross_entropy(y_final, target_ids)
+    
+    # Compute bootstrapped Q-targets
+    loss_q = 0.0
+    for t in range(n):
+        # Halt reward
+        R_t = 1.0 if evaluate_correct(y_final, target_ids) else 0.0
+        
+        # Halt Target
+        q_halt_target = R_t
+        # Continue Target
+        if t < n - 1:
+            with torch.no_grad():
+                q_next = target_model.q_head(states[t+1])
+            q_cont_target = torch.max(q_next, dim=-1)[0]
+        else:
+            q_cont_target = R_t # boundary condition
+            
+        loss_q += (q_preds[t][:, 0] - q_cont_target).pow(2).mean()
+        loss_q += (q_preds[t][:, 1] - q_halt_target).pow(2).mean()
+        
+    total_loss = loss_task + loss_q
+    total_loss.backward()
+    optimizer.step()
+    
+    # Update target model via Polyak EMA
+    update_target_network(model, target_model, tau=0.005)
+```
+
+### 6.2 Inference Rollouts Pseudocode (PTRM K-selection)
+```python
+def ptrm_inference(input_ids, model, K, sigma_base, n, T, max_noise_step):
+    B = input_ids.size(0)
+    candidates = []
+    scores = []
+    
+    for k in range(K):
+        # 1. Initialization
+        X_raw = model.embed(input_ids)
+        z = model.M_meta.expand(B, -1, -1)
+        y = model.init_answer(X_raw)
+        
+        # 2. Run planning loop
+        for c in range(1, T + 1):
+            for i in range(1, n + 1):
+                # Apply noise if K > 1
+                if K > 1 and (c * n + i) <= max_noise_step:
+                    # Annealing
+                    sigma = sigma_base * math.sqrt(1 - i/n)
+                    z = z + torch.randn_like(z) * sigma
+                    
+                X_concat = torch.cat([z, y, X_raw], dim=1)
+                z = model.planning_block(X_concat)[:, :N_meta, :]
+            y = model.answer_update_block(z, y)
+            
+        s_final = pool(z, y)
+        score = model.q_head(s_final)[:, 1] # Halt Q-value or BCE prob
+        
+        candidates.append(y)
+        scores.append(score)
+        
+    # Selection Policy (Consensus Filter)
+    best_candidate = consensus_selection(candidates, scores)
+    return model.decode(best_candidate)
+```
+
+---
+
+## 7. Hardware & Dependencies
+
+* **Software:** Requires PyTorch $\ge 1.12$ and the `mamba-ssm` package.
+* **Hardware:** A single GPU with $\ge 16$ GB VRAM (e.g., NVIDIA RTX 4090 / A100) is recommended for standard training. PTRM inference is highly parallelizable; batching $K$ candidates scales memory linearly.
