@@ -5,7 +5,7 @@
 - [x] Task 3: Pure PyTorch SSM (Structured State Duality) Backend
 - [x] Task 4: Hybrid Fusion Block
 - [x] Task 5: Answer Update Block
-- [ ] Task 6: Planning Loop (z, y Recurrent Cycles)
+- [x] Task 6: Planning Loop (z, y Recurrent Cycles)
 - [ ] Task 7: BCE Halting Head
 - [ ] Task 8: End-to-End Forward Pass
 - [ ] Task 9: Training Losses (Sparse Task + BCE Halting Loss)
