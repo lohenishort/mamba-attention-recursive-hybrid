@@ -43,3 +43,16 @@ def test_hybrid_block_gradient_flow() -> None:
     # Verify gradients flow to learned beta scaling parameters
     assert block.beta_1.grad is not None
     assert block.beta_2.grad is not None
+
+
+def test_rms_norm() -> None:
+    from mamba_hybrid.operators import RMSNorm
+
+    d_model: int = 64
+    x: torch.Tensor = torch.randn(2, 32, d_model)
+    norm: RMSNorm = RMSNorm(d_model)
+    y: torch.Tensor = norm(x)
+    assert y.shape == x.shape
+    # Check that mean of y^2 along the last dimension is approximately 1
+    variance: torch.Tensor = y.pow(2).mean(-1)
+    assert torch.allclose(variance, torch.ones_like(variance), atol=1e-4)

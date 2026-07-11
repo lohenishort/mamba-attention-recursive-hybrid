@@ -6,6 +6,23 @@ from mamba_hybrid.attention import PrefixCausalAttention
 from mamba_hybrid.ssm import Mamba2SSDScan
 
 
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (RMSNorm) for PyTorch 2.0.0+ compatibility.
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps: float = eps
+        self.weight: nn.Parameter = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [..., d_model]
+        variance: torch.Tensor = x.pow(2).mean(-1, keepdim=True)
+        # return: [..., d_model]
+        return x * torch.rsqrt(variance + self.eps) * self.weight
+
+
 class MambaAttentionHybridBlock(nn.Module):
     """
     Hybrid block that combines the attention branch and the SSM branch
@@ -30,8 +47,8 @@ class MambaAttentionHybridBlock(nn.Module):
 
         self.beta_1: nn.Parameter = nn.Parameter(torch.ones(self.d_model))
         self.beta_2: nn.Parameter = nn.Parameter(torch.ones(self.d_model))
-        self.norm_attn: nn.RMSNorm = nn.RMSNorm(self.d_model)
-        self.norm_ssm: nn.RMSNorm = nn.RMSNorm(self.d_model)
+        self.norm_attn: RMSNorm = RMSNorm(self.d_model)
+        self.norm_ssm: RMSNorm = RMSNorm(self.d_model)
         self.out_proj: nn.Linear = nn.Linear(self.d_model, self.d_model, bias=False)
 
     def forward(self, x: torch.Tensor, causal: bool = False) -> torch.Tensor:
