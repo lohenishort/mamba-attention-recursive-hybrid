@@ -6,7 +6,7 @@
 
 **Architecture:** A parallel attention and Mamba-2 hybrid operator merges sequence features using RMSNorm and gating. A dual-state ($y, z$) planning loop recursively updates a latent reasoning state and an answer state over variable compute steps, overseen by an ACT halting head and regularized with stochastic noise.
 
-**Tech Stack:** PyTorch, Poetry, pytest, ruff, mypy.
+**Tech Stack:** PyTorch, uv, pytest, ruff, mypy.
 
 ## Global Constraints
 
@@ -18,7 +18,7 @@
 - **NEVER** detach the latent planning state's computational graph at the boundaries of each supervision segment to prevent gradient explosion and instability during long recursive unrolls.
 - **NEVER** hardcode reward-shaping values or negative step penalties inside the Q-learning ACT halting head; **ALWAYS** use the mathematically verified binary reward scheme (1 for correct, 0 for incorrect) with explicit hyperparameter-driven compute bounds (`M_min`/`M_max`).
 - **NEVER** modify or delete files under `tests/conftest.py` or the test verification suites.
-- **NEVER** modify `poetry.lock` or add dependencies directly to `pyproject.toml` without verifying compatibility via `poetry check`.
+- **NEVER** modify lockfiles directly unless running `uv lock --update`.
 
 ---
 
@@ -48,31 +48,28 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_config.py -v`
+  Run: `uv run pytest tests/test_config.py -v`
   Expected: ModuleNotFoundError or ImportError.
 
 - [ ] **Step 3: Create pyproject.toml and config file**
   Create `pyproject.toml` containing:
   ```toml
-  [tool.poetry]
+  [project]
   name = "mamba-attention-recursive-hybrid"
   version = "0.1.0"
   description = "Mamba-Attention Recursive Reasoning Hybrid framework"
-  authors = ["Antigravity Developer"]
-  packages = [{include = "mamba_hybrid"}]
+  readme = "README.md"
+  requires-python = ">=3.10"
+  dependencies = [
+      "torch>=2.0.0",
+  ]
 
-  [tool.poetry.dependencies]
-  python = "^3.10"
-  torch = "^2.0.0"
-
-  [tool.poetry.group.dev.dependencies]
-  pytest = "^7.0.0"
-  mypy = "^1.0.0"
-  ruff = "^0.0.260"
-
-  [build-system]
-  requires = ["poetry-core>=1.0.0"]
-  build-backend = "poetry.core.masonry.api"
+  [dependency-groups]
+  dev = [
+      "pytest>=7.0.0",
+      "mypy>=1.0.0",
+      "ruff>=0.0.260",
+  ]
   ```
   Create `mamba_hybrid/config.py` containing:
   ```python
@@ -91,7 +88,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_config.py -v`
+  Run: `uv run pytest tests/test_config.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -130,7 +127,7 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_attention.py -v`
+  Run: `uv run pytest tests/test_attention.py -v`
   Expected: FAIL with Import/ModuleNotFoundError.
 
 - [ ] **Step 3: Implement PrefixCausalAttention**
@@ -169,7 +166,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_attention.py -v`
+  Run: `uv run pytest tests/test_attention.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -210,7 +207,7 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_ssm.py -v`
+  Run: `uv run pytest tests/test_ssm.py -v`
   Expected: FAIL with import failure.
 
 - [ ] **Step 3: Implement Mamba2SSDScan in pure PyTorch**
@@ -253,7 +250,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_ssm.py -v`
+  Run: `uv run pytest tests/test_ssm.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -290,7 +287,7 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_operators.py -v`
+  Run: `uv run pytest tests/test_operators.py -v`
   Expected: FAIL (import or block instantiation failure).
 
 - [ ] **Step 3: Implement MambaAttentionHybridBlock with scale-normalized fusion**
@@ -350,7 +347,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_operators.py -v`
+  Run: `uv run pytest tests/test_operators.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -388,7 +385,7 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_answer_update.py -v`
+  Run: `uv run pytest tests/test_answer_update.py -v`
   Expected: FAIL.
 
 - [ ] **Step 3: Implement AnswerUpdateBlock cross-attention**
@@ -427,7 +424,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_answer_update.py -v`
+  Run: `uv run pytest tests/test_answer_update.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -468,7 +465,7 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_planning.py -v`
+  Run: `uv run pytest tests/test_planning.py -v`
   Expected: FAIL.
 
 - [ ] **Step 3: Implement PlanningLoop running cycles with warmup support**
@@ -502,7 +499,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_planning.py -v`
+  Run: `uv run pytest tests/test_planning.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -541,7 +538,7 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_halting.py -v`
+  Run: `uv run pytest tests/test_halting.py -v`
   Expected: FAIL.
 
 - [ ] **Step 3: Implement ACTHaltingModule with BCE only**
@@ -570,7 +567,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_halting.py -v`
+  Run: `uv run pytest tests/test_halting.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -608,7 +605,7 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_model.py -v`
+  Run: `uv run pytest tests/test_model.py -v`
   Expected: FAIL.
 
 - [ ] **Step 3: Implement MambaAttentionHybrid loop coordination**
@@ -672,7 +669,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_model.py -v`
+  Run: `uv run pytest tests/test_model.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -710,7 +707,7 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_loss.py -v`
+  Run: `uv run pytest tests/test_loss.py -v`
   Expected: FAIL.
 
 - [ ] **Step 3: Implement compute_bce_joint_loss**
@@ -739,7 +736,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_loss.py -v`
+  Run: `uv run pytest tests/test_loss.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -786,7 +783,7 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_q_learning.py -v`
+  Run: `uv run pytest tests/test_q_learning.py -v`
   Expected: FAIL.
 
 - [ ] **Step 3: Implement Q-learning extensions**
@@ -870,7 +867,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_q_learning.py -v`
+  Run: `uv run pytest tests/test_q_learning.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -908,7 +905,7 @@
   ```
 
 - [ ] **Step 2: Run test to verify it fails**
-  Run: `poetry run pytest tests/test_inference.py -v`
+  Run: `uv run pytest tests/test_inference.py -v`
   Expected: FAIL.
 
 - [ ] **Step 3: Implement ptrm_inference and consensus voting**
@@ -992,7 +989,7 @@
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
-  Run: `poetry run pytest tests/test_inference.py -v`
+  Run: `uv run pytest tests/test_inference.py -v`
   Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -1036,13 +1033,13 @@
   ```
 
 - [ ] **Step 2: Run all pytest suites**
-  Run: `poetry run pytest`
+  Run: `uv run pytest`
   Expected: All test suites PASS.
 
 - [ ] **Step 3: Run Linters and Type Checkers**
   Run:
-  - `poetry run ruff check .`
-  - `poetry run mypy . --strict`
+  - `uv run ruff check .`
+  - `uv run mypy . --strict`
   Expected: Clean execution.
 
 - [ ] **Step 4: Commit**

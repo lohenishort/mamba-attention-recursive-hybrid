@@ -2,14 +2,14 @@
 The Mamba-Attention Recursive Reasoning Hybrid framework is a modular, high-performance PyTorch library designed to research, train, and evaluate hybrid sequence models that combine Structured State Duality (SSD/Mamba-2) and attention mechanisms. The core architecture implements a decoupled "thinking fast and slow" paradigm: a bidirectional attention-based latent planning loop recursively refines memory and task-constraint representations (meta-tokens) over variable compute steps, followed by an autoregressive Mamba-2 generator that decodes the final solution sequence. The framework integrates Adaptive Computation Time (ACT) halting policies (via Q-learning or BCE stopping probability heads), Probabilistic Tiny Recursive Model (PTRM) stochastic inference-time scaling (via Gaussian noise injection and Q-head selection), and sparse final-step supervision to prevent shortcut memorization on complex, deterministic reasoning tasks.
 
 # Build & Test Commands
-All development commands must be executed using Poetry.
-- **Install Dependencies:** `poetry install --all-groups`
-- **Run Unit & Integration Tests:** `poetry run pytest -v`
-- **Run Type Checks:** `poetry run mypy . --strict`
-- **Run Lint Checks:** `poetry run ruff check .`
-- **Format Code:** `poetry run ruff format .`
-- **Run Synthetic Maze-Hard Generator Check:** `poetry run python -m scripts.generate_data --task maze --size 30 --num-samples 10`
-- **Run Single-Step Baseline Training:** `poetry run python -m train.run_experiment --config configs/baseline_sudoku.yaml --dry-run`
+All development commands must be executed using **uv**.
+- **Install Dependencies:** `uv sync`
+- **Run Unit & Integration Tests:** `uv run pytest -v`
+- **Run Type Checks:** `uv run mypy . --strict`
+- **Run Lint Checks:** `uv run ruff check .`
+- **Format Code:** `uv run ruff format .`
+- **Run Synthetic Maze-Hard Generator Check:** `uv run python -m scripts.generate_data --task maze --size 30 --num-samples 10`
+- **Run Single-Step Baseline Training:** `uv run python -m train.run_experiment --config configs/baseline_sudoku.yaml --dry-run`
 
 # Code Style & Conventions
 - **ALWAYS** write the Mamba-2 / SSD scan operations in pure, readable PyTorch tensor operations as the default fallback to ensure CPU/GPU compatibility and easy local debugging.
@@ -22,15 +22,15 @@ All development commands must be executed using Poetry.
 
 # File System Guardrails
 - **NEVER** modify or delete files under `tests/conftest.py` or the test verification suites unless explicitly instructed.
-- **NEVER** modify `poetry.lock` or add dependencies directly to `pyproject.toml` without verifying compatibility via `poetry check`.
+- **NEVER** modify lockfiles directly unless running `uv lock --update`.
 - **NEVER** create or modify temporary scratch directories or raw dataset dumps outside of the designated `data/` and `tmp/` gitignored folders.
 - **NEVER** commit model checkpoints, tensorboard logs, or raw generated dataset files (e.g., `.pt`, `.safetensors`, `.jsonl`, `.log`) to the repository.
 
 # Git & PR Workflow
-- **ALWAYS** run linting (`poetry run ruff check .`), formatting (`poetry run ruff format .`), and type-checking (`poetry run mypy . --strict`) locally before committing.
+- **ALWAYS** run linting (`uv run ruff check .`), formatting (`uv run ruff format .`), and type-checking (`uv run mypy . --strict`) locally before committing.
 - **ALWAYS** write descriptive, structured commit messages prefixing changes with `feat:`, `fix:`, `docs:`, `refactor:`, or `test:`.
 - **ALWAYS** ensure that any new architectural blocks or training/evaluation features are accompanied by corresponding unit tests in the `tests/` directory.
-- **ALWAYS** check that the test suite passes completely (`poetry run pytest`) before creating a pull request.
+- **ALWAYS** check that the test suite passes completely (`uv run pytest`) before creating a pull request.
 
 # Known Gotchas & Troubleshooting
 - **Mamba-2 Custom Kernels:** Compilation of `mamba-ssm` and `causal-conv1d` fails on machines without compatible CUDA toolkits or with mismatched PyTorch/CUDA versions. Always run with the configuration `use_cuda_kernels: false` when training or testing on CPU or generic CI/CD pipelines.
