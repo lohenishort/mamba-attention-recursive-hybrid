@@ -11,4 +11,4 @@
 - [x] Task 9: Training Losses (Sparse Task + BCE Halting Loss)
 - [x] Task 10: Q-Learning Halting Extension
 - [x] Task 11: PTRM Inference & Consensus-Augmented Selection
-- [ ] Task 12: Integration Tests and Linters
+- [x] Task 12: Integration Tests and Linters
