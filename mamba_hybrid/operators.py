@@ -18,9 +18,9 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., d_model]
-        variance: torch.Tensor = x.pow(2).mean(-1, keepdim=True)
+        variance: torch.Tensor = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
         # return: [..., d_model]
-        return x * torch.rsqrt(variance + self.eps) * self.weight
+        return (x * torch.rsqrt(variance + self.eps).to(x.dtype)) * self.weight
 
 
 class MambaAttentionHybridBlock(nn.Module):
@@ -42,7 +42,11 @@ class MambaAttentionHybridBlock(nn.Module):
 
         self.attn_branch: PrefixCausalAttention = PrefixCausalAttention(config)
         self.ssm_branch: Mamba2SSDScan = Mamba2SSDScan(
-            self.d_model, expansion=2, num_heads=8, d_state=16
+            self.d_model,
+            expansion=2,
+            num_heads=8,
+            d_state=16,
+            use_cuda_kernels=config.use_cuda_kernels,
         )
 
         self.beta_1: nn.Parameter = nn.Parameter(torch.ones(self.d_model))

@@ -56,3 +56,30 @@ def test_rms_norm() -> None:
     # Check that mean of y^2 along the last dimension is approximately 1
     variance: torch.Tensor = y.pow(2).mean(-1)
     assert torch.allclose(variance, torch.ones_like(variance), atol=1e-4)
+
+
+def test_hybrid_block_causal() -> None:
+    config: MambaHybridConfig = MambaHybridConfig(d_model=64, n_meta=16)
+    block: MambaAttentionHybridBlock = MambaAttentionHybridBlock(config)
+
+    # Input tensor x: [batch_size, seq_len, d_model]
+    x: torch.Tensor = torch.randn(2, 32, 64, requires_grad=True)
+    out: torch.Tensor = block(x, causal=True)
+
+    # Assert shape
+    assert out.shape == (2, 32, 64)
+
+    # Assert gradient calculation
+    loss: torch.Tensor = out.sum()
+    loss.backward()  # type: ignore[no-untyped-call]
+
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
+
+    # Verify gradients flow to other parameters
+    assert block.in_proj.weight.grad is not None
+    assert block.out_proj.weight.grad is not None
+    assert block.attn_branch.out_proj.weight.grad is not None
+    assert block.ssm_branch.out_proj.weight.grad is not None
+    assert block.beta_1.grad is not None
+    assert block.beta_2.grad is not None
