@@ -90,21 +90,29 @@ The planning process consists of $T$ cycles. Each cycle $c \in [1, T]$ contains:
 
 Adaptive Computation Time (ACT) decides when to stop planning. We support two configurable heads.
 
-### 3.1 Sequence Representation Pooling
+### 3.1 Sequence Representation Pooling & Detach Logic
 To produce sequence-level halting decisions from token-level representations, both ACT heads apply global average pooling across the sequence dimension of the combined state:
 $$s_t = \text{GlobalAveragePool}\left(\text{Concat}(z_t, y_t)\right) \in \mathbb{R}^{B \times D}$$
+
+> [!IMPORTANT]
+> **Halting Head Detach Gate:** To prevent halting head optimization (Q-loss or BCE halting loss) from corrupting the core planning representation, $s_t$ must be detached from the computational graph of the planning backbone before feeding into the halting networks:
+> $$\text{planning backbone} \rightarrow s_t \rightarrow s_t\text{.detach()} \rightarrow \text{halting head}$$
 
 ---
 
 ### 3.2 Mode A: Q-Learning Head (Temporal Credit Assignment)
 We define a Q-network $f_Q(s_t) \rightarrow \mathbb{R}^2$ outputting values for $a \in \{\text{continue}, \text{halt}\}$:
-$$[Q(s_t, \text{continue}), Q(s_t, \text{halt})] = \text{Linear}(\text{ReLU}(\text{Linear}(s_t)))$$
+$$[Q(s_t, \text{continue}), Q(s_t, \text{halt})] = \text{Linear}(\text{ReLU}(\text{Linear}(s_t\text{.detach()}))))$$
 
 * **1-Step Bootstrapped Q-Targets:**
-  * **Halt Target:** $Q^*(s_t, \text{halt}) = R_t = \mathbb{I}(\hat{y}_t == Y_{\text{target}})$
+  * **Halt Target:** $Q^*(s_t, \text{halt}) = R_t$.
   * **Continue Target ($t < m$):**
-    $$Q^*(s_t, \text{continue}) = \max \left( Q_{\text{target}}(s_{t+1}, \text{continue}), Q_{\text{target}}(s_{t+1}, \text{halt}) \right)$$
+    $$Q^*(s_t, \text{continue}) = \gamma \max \left( Q_{\text{target}}(s_{t+1}, \text{continue}), Q_{\text{target}}(s_{t+1}, \text{halt}) \right)$$
     *At the absolute step boundary $M_{\text{max}}$, the continue target is undefined and the loss is masked ($\lambda_m^{\text{cont}} = 0$).*
+* **Discount Factor ($\gamma$):** By default, $\gamma = 1.0$ (undiscounted) because the objective is finite-horizon reasoning rather than infinite-horizon reinforcement learning.
+* **Reward Definition ($R_t$):**
+  $$R_t = \mathbb{I}(\hat{y}_t == Y_{\text{target}})$$
+  *While this binary reward is the default, future iterations can swap $R_t$ with token accuracy, log-likelihood, or verifier scores without framework modification.*
 * **Target Network ($Q_{\text{target}}$):** Updated via Polyak EMA tracking:
   $$\theta_{\text{target}} \leftarrow \tau \theta_{\text{online}} + (1 - \tau) \theta_{\text{target}} \quad (\text{default } \tau = 0.005)$$
 * **Loss Function:**
@@ -113,7 +121,7 @@ $$[Q(s_t, \text{continue}), Q(s_t, \text{halt})] = \text{Linear}(\text{ReLU}(\te
 ---
 
 ### 3.3 Mode B: BCE Halting Classifier (Static Correctness Classifier)
-Predicts halting probability $p_t = \sigma(\text{Linear}(s_t))$ with targets $p_t^* = 1.0$ if the prediction $\hat{y}_t$ is correct, else $0.0$.
+Predicts halting probability $p_t = \sigma(\text{Linear}(s_t\text{.detach()}))$ with targets $p_t^* = 1.0$ if the prediction $\hat{y}_t$ is correct, else $0.0$.
 $$\mathcal{L}_{\text{BCE}} = -\frac{1}{m} \sum_{t=1}^{m} \left( p_t^* \log(p_t) + (1 - p_t^*) \log(1 - p_t) \right)$$
 
 ---
@@ -133,7 +141,9 @@ where:
 * $\mathcal{L}_{\text{task}} = \text{CrossEntropy}(\text{Decode}(y_T), Y_{\text{target}})$ applied sparsely at cycle $T$.
 * $\mathcal{L}_{\text{halting}} = \mathcal{L}_{\text{Q}}$ (Mode A) or $\mathcal{L}_{\text{BCE}}$ (Mode B).
 * $\alpha \in \mathbb{R}^+$ is a scaling hyperparameter (default $\alpha = 1.0$). 
-* For stability, $s_t$ is detached from the planning backbone during halting loss backpropagation to prevent halting-head optimization from corrupting latent representations.
+
+> [!TIP]
+> **Default Implementation Path:** Build and validate the BCE halting classifier (Mode B) first, then implement the Q-learning head (Mode A) behind a configuration flag to minimize risk.
 
 ---
 
@@ -176,11 +186,16 @@ To mitigate this, the framework defaults to **Policy B** for all $K > 1$.
 
 ---
 
+#### 4.4 Computational Complexity Callout
+Running $K$ rollouts increases inference compute cost by $K\times$. Because rollouts are independent, they are batched together along the batch dimension (increasing the effective batch size to $B \cdot K$). This is highly parallelizable on GPUs but increases peak activation memory, representing a direct trade-off between inference-time memory footprint and model accuracy.
+
+---
+
 ## 5. Hyperparameter Settings, Training Recipe, and Evaluation
 
 This section details the concrete settings and setup required to reproduce training and evaluation pipelines.
 
-### 5.1 Hyperparameter Specifications
+### 5.1 Recommended Starting Defaults
 
 | Hyperparameter | Symbol | Recommended Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -197,7 +212,7 @@ This section details the concrete settings and setup required to reproduce train
 * **Learning Rate:** Peak learning rate of $1\text{e-}4$, using a linear warmup over the first $10\%$ of steps followed by cosine decay to $1\text{e-}6$.
 * **Batch Size:** $32$ samples.
 * **Gradient Clipping:** Max norm $1.0$ applied to all parameters.
-* **Epochs:** $100,000$ training steps.
+* **Steps:** $100,000$ training steps *(a recommended baseline for convergence monitoring, not a fixed requirement)*.
 
 ### 5.3 Evaluation Metrics
 The framework logs the following metrics during training and evaluation:
@@ -245,7 +260,7 @@ def train_step(input_ids, target_ids, model, optimizer, target_model, M_max, n, 
             z = z + torch.randn_like(z) * random.uniform(0, 0.25) * 0.05
             
         s_t = pool(z, y)
-        q_pred = model.q_head(s_t)
+        q_pred = model.q_head(s_t.detach()) # Detached gate to isolate loss
         states.append(s_t)
         q_preds.append(q_pred)
         
