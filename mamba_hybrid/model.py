@@ -20,6 +20,8 @@ class MambaAttentionHybrid(nn.Module):
         self.l_ans: int = config.l_ans
         self.n_steps: int = config.n_steps
         self.t_cycles: int = config.t_cycles
+        self.M_min: int = config.M_min
+        self.M_max: int = config.M_max
 
         # Learned initial planning state meta-tokens
         self.M_meta: nn.Parameter = nn.Parameter(
@@ -122,12 +124,14 @@ class MambaAttentionHybrid(nn.Module):
             z, y = self.planning_loop(X_raw, z, y, warmup=True)
 
         # Supervision cycle (T cycle, grad enabled)
-        z = z.detach().requires_grad_(True)
-        y = y.detach().requires_grad_(True)
+        if self.training:
+            num_steps: int = int(torch.randint(self.M_min, self.M_max + 1, (1,)).item())
+        else:
+            num_steps = self.n_steps
 
         q_preds: list[torch.Tensor] = []
         states: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for i in range(1, self.n_steps + 1):
+        for i in range(1, num_steps + 1):
             X_concat: torch.Tensor = torch.cat(
                 [z, y, X_raw], dim=1
             )  # [batch_size, n_meta + l_ans + seq_len, d_model]

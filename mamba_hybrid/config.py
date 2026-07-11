@@ -11,3 +11,5 @@ class MambaHybridConfig:
     max_noise_step: int = 20
     sigma_base: float = 0.05
     use_cuda_kernels: bool = False
+    M_min: int = 1
+    M_max: int = 6

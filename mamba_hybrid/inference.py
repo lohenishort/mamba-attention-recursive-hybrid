@@ -74,20 +74,23 @@ def ptrm_inference(
         # batch_scores: [K]
         batch_scores: torch.Tensor = stacked_scores[:, b]
 
-        # Group candidates based on similarity of their checksum signature
+        # Group candidates based on similarity using pairwise MSE/L2 distance
         groups: dict[int, list[int]] = {}
-        unique_keys: list[float] = []
+        unique_representatives: list[int] = []
+        epsilon: float = 1e-4
         for k in range(K):
-            sig: float = batch_cands[k].sum().item()
             matched: bool = False
-            for idx, val in enumerate(unique_keys):
-                if abs(sig - val) < 1e-2:
+            for idx, rep in enumerate(unique_representatives):
+                mse: float = float(
+                    torch.mean((batch_cands[k] - batch_cands[rep]) ** 2).item()
+                )
+                if mse < epsilon:
                     groups[idx].append(k)
                     matched = True
                     break
             if not matched:
-                new_idx: int = len(unique_keys)
-                unique_keys.append(sig)
+                new_idx: int = len(unique_representatives)
+                unique_representatives.append(k)
                 groups[new_idx] = [k]
 
         # Find the group with the largest number of members

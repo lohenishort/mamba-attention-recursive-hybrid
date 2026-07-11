@@ -9,3 +9,5 @@ def test_config_defaults() -> None:
     assert config.n_steps == 6
     assert config.t_cycles == 5
     assert config.use_cuda_kernels is False
+    assert config.M_min == 1
+    assert config.M_max == 6

@@ -49,3 +49,41 @@ def test_q_learning_with_states_and_gradients() -> None:
             assert torch.norm(param.grad) >= 0.0
             grad_found = True
     assert grad_found, "Could not find gradient for q_mlp parameters"
+
+
+def test_q_learning_gradients_initial_params() -> None:
+    # 1. Gradients flow to M_meta / ans_init_proj when t_cycles=1
+    config = MambaHybridConfig(d_model=64, n_meta=16, l_ans=8, t_cycles=1)
+    model = MambaAttentionHybrid(config)
+    model.train()
+    x = torch.randn(2, 32, 64)
+    y_final, states, q_preds = model.forward_q(x)
+    loss = y_final.sum() + sum(q.sum() for q in q_preds)
+    loss.backward()  # type: ignore[no-untyped-call]
+
+    assert model.M_meta.grad is not None
+    assert model.ans_init_proj.weight.grad is not None
+
+    # 2. Number of steps is randomized in training mode but matches n_steps in eval mode
+    config_bounds = MambaHybridConfig(
+        d_model=64, n_meta=16, l_ans=8, M_min=2, M_max=5, n_steps=6
+    )
+    model_bounds = MambaAttentionHybrid(config_bounds)
+
+    # Eval mode
+    model_bounds.eval()
+    _, states_eval, q_preds_eval = model_bounds.forward_q(x)
+    assert len(states_eval) == 6
+    assert len(q_preds_eval) == 6
+
+    # Train mode
+    model_bounds.train()
+    steps_observed = set()
+    for _ in range(50):
+        _, states_train, q_preds_train = model_bounds.forward_q(x)
+        num_steps = len(states_train)
+        assert 2 <= num_steps <= 5
+        assert len(q_preds_train) == num_steps
+        steps_observed.add(num_steps)
+    # Check that we observed at least some variety to confirm randomization
+    assert len(steps_observed) > 1
