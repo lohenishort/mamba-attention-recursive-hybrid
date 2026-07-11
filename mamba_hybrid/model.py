@@ -94,3 +94,52 @@ class MambaAttentionHybrid(nn.Module):
             z, y
         )  # [batch_size, l_ans, d_model]
         return y_final, bce_probs
+
+    def forward_q(
+        self, X_raw: torch.Tensor
+    ) -> tuple[
+        torch.Tensor,
+        list[tuple[torch.Tensor, torch.Tensor]],
+        list[torch.Tensor],
+    ]:
+        """Forward pass coordinating warmup loops and final supervision loop for Q-learning.
+
+        Args:
+            X_raw: Raw input context of shape [B, L_raw, D]
+
+        Returns:
+            y_final: Final updated answer prediction state of shape [B, L_ans, D]
+            states: List of tuples (z, y) at each step of the supervision cycle.
+            q_preds: List of Q-value predictions from the ACT head for each step.
+        """
+        # X_raw: [batch_size, seq_len, d_model]
+        B, L_raw, D = X_raw.shape
+        z: torch.Tensor = self.M_meta.expand(B, -1, -1)  # [batch_size, n_meta, d_model]
+        y: torch.Tensor = self.init_answer(X_raw)  # [batch_size, l_ans, d_model]
+
+        # Warmup phase (T-1 cycles, no grad)
+        for c in range(1, self.t_cycles):
+            z, y = self.planning_loop(X_raw, z, y, warmup=True)
+
+        # Supervision cycle (T cycle, grad enabled)
+        z = z.detach().requires_grad_(True)
+        y = y.detach().requires_grad_(True)
+
+        q_preds: list[torch.Tensor] = []
+        states: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for i in range(1, self.n_steps + 1):
+            X_concat: torch.Tensor = torch.cat(
+                [z, y, X_raw], dim=1
+            )  # [batch_size, n_meta + l_ans + seq_len, d_model]
+            z = self.planning_loop.planning_block(X_concat, causal=False)[
+                :, : self.n_meta, :
+            ]  # [batch_size, n_meta, d_model]
+
+            q_vals: torch.Tensor = self.q_head.get_q_values(z, y)  # [batch_size, 2]
+            q_preds.append(q_vals)
+            states.append((z, y))
+
+        y_final: torch.Tensor = self.planning_loop.answer_update_block(
+            z, y
+        )  # [batch_size, l_ans, d_model]
+        return y_final, states, q_preds
