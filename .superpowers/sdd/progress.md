@@ -3,7 +3,7 @@
 - [x] Task 1: Environment Scaffolding and Configurations
 - [x] Task 2: Attention Branch with Prefix-Causal Masking
 - [x] Task 3: Pure PyTorch SSM (Structured State Duality) Backend
-- [ ] Task 4: Hybrid Fusion Block
+- [x] Task 4: Hybrid Fusion Block
 - [ ] Task 5: Answer Update Block
 - [ ] Task 6: Planning Loop (z, y Recurrent Cycles)
 - [ ] Task 7: BCE Halting Head
