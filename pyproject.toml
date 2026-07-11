@@ -1,0 +1,19 @@
+[project]
+name = "mamba-attention-recursive-hybrid"
+version = "0.1.0"
+description = "Mamba-Attention Recursive Reasoning Hybrid framework"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "mypy>=1.0.0",
+    "ruff>=0.0.260",
+]
+
+[tool.pytest.ini_options]
+pythonpath = "."
