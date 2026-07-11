@@ -7,7 +7,7 @@
 - [x] Task 5: Answer Update Block
 - [x] Task 6: Planning Loop (z, y Recurrent Cycles)
 - [x] Task 7: BCE Halting Head
-- [ ] Task 8: End-to-End Forward Pass
+- [x] Task 8: End-to-End Forward Pass
 - [ ] Task 9: Training Losses (Sparse Task + BCE Halting Loss)
 - [ ] Task 10: Q-Learning Halting Extension
 - [ ] Task 11: PTRM Inference & Consensus-Augmented Selection
