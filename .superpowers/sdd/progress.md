@@ -4,7 +4,7 @@
 - [x] Task 2: Attention Branch with Prefix-Causal Masking
 - [x] Task 3: Pure PyTorch SSM (Structured State Duality) Backend
 - [x] Task 4: Hybrid Fusion Block
-- [ ] Task 5: Answer Update Block
+- [x] Task 5: Answer Update Block
 - [ ] Task 6: Planning Loop (z, y Recurrent Cycles)
 - [ ] Task 7: BCE Halting Head
 - [ ] Task 8: End-to-End Forward Pass
