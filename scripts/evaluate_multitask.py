@@ -27,11 +27,16 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading Multi-Task Evaluation Environment on {device}...")
 
-    # Configuration (must match training parameters)
+    # Load state dict first to infer configuration parameters dynamically
+    state_dict = torch.load(model_path, map_location=device)
+    d_model = state_dict["embed.weight"].shape[1]
+    n_meta = state_dict["reasoning_encoder.M_meta"].shape[1]
+
+    # Configuration
     l_ans = 32
     max_seq_len = 128
     config = MambaHybridConfig(
-        d_model=64, n_meta=16, l_ans=l_ans, n_steps=2, t_cycles=2
+        d_model=d_model, n_meta=n_meta, l_ans=l_ans, n_steps=4, t_cycles=3
     )
 
     # Load dataset
@@ -41,7 +46,7 @@ def main() -> None:
 
     # Load model
     model = UnifiedReasoningLLM(config, vocab_size=128).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(state_dict)
     model.eval()
 
     # Group samples by task type
