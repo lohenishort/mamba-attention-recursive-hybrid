@@ -63,9 +63,7 @@ def main() -> None:
         for step, (grid_flat, target_ids) in enumerate(train_loader, 1):
             grid_flat, target_ids = grid_flat.to(device), target_ids.to(device)
 
-            with torch.amp.autocast(device_type=device.type):
-                logits, bce_probs = model(grid_flat)
-
+            logits, bce_probs = model(grid_flat)
             preds = logits.argmax(dim=-1)
             is_correct = (preds == target_ids).all(dim=-1)
             correct_mask = is_correct.float()
