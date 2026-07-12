@@ -22,7 +22,8 @@ class PlanningLoop(nn.Module):
         self.planning_block: MambaAttentionHybridBlock = MambaAttentionHybridBlock(
             config
         )
-        self.answer_update_block: AnswerUpdateBlock = AnswerUpdateBlock(config)
+        
+        self.answer_update_block: AnswerUpdateBlock | None = None
         self.answer_update_blocks: nn.ModuleDict | None = None
         if config.use_moe:
             self.answer_update_blocks = nn.ModuleDict(
@@ -33,6 +34,8 @@ class PlanningLoop(nn.Module):
                     "GSM8K": AnswerUpdateBlock(config),
                 }
             )
+        else:
+            self.answer_update_block = AnswerUpdateBlock(config)
 
     def forward(
         self,
@@ -78,7 +81,6 @@ class PlanningLoop(nn.Module):
                         task = task_names[i]
                         if task not in self.answer_update_blocks:
                             task = "MAZE"
-                        # Cast to AnswerUpdateBlock to help mypy type inference
                         block = self.answer_update_blocks[task]
                         assert isinstance(block, AnswerUpdateBlock)
                         y_list.append(block(z[i : i + 1], y[i : i + 1]))
@@ -87,6 +89,6 @@ class PlanningLoop(nn.Module):
                     block = self.answer_update_blocks["MAZE"]
                     assert isinstance(block, AnswerUpdateBlock)
                     y = block(z, y)
-            else:
+            elif self.answer_update_block is not None:
                 y = self.answer_update_block(z, y)
         return z, y

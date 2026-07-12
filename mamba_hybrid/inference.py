@@ -9,6 +9,7 @@ def ptrm_inference(
     K: int = 5,
     sigma_base: float = 0.05,
     max_noise_step: int = 20,
+    task_names: list[str] | None = None,
 ) -> torch.Tensor:
     """Probabilistic Tiny Recursive Model (PTRM) inference with majority-consensus voting.
 
@@ -28,7 +29,7 @@ def ptrm_inference(
     if K == 1:
         with torch.no_grad():
             y_final: torch.Tensor
-            y_final, _ = model(input_ids)
+            y_final, _ = model(input_ids, task_names=task_names)
             return y_final
 
     candidates: list[torch.Tensor] = []
@@ -52,11 +53,22 @@ def ptrm_inference(
                     # X_concat: [batch_size, n_meta + l_ans + seq_len, d_model]
                     X_concat: torch.Tensor = torch.cat([z, y, input_ids], dim=1)
                     # Update planning state z: [batch_size, n_meta, d_model]
-                    z = model.planning_loop.planning_block(X_concat, causal=False)[
-                        :, : model.n_meta, :
-                    ]
+                    z = model.planning_loop.planning_block(
+                        X_concat, causal=False, task_names=task_names
+                    )[:, : model.n_meta, :]
                 # Update answer state y: [batch_size, l_ans, d_model]
-                y = model.planning_loop.answer_update_block(z, y)
+                if model.planning_loop.config.use_moe and model.planning_loop.answer_update_blocks is not None:
+                    y_list = []
+                    for i in range(y.shape[0]):
+                        task = task_names[i] if task_names is not None else "MAZE"
+                        if task not in model.planning_loop.answer_update_blocks:
+                            task = "MAZE"
+                        y_list.append(model.planning_loop.answer_update_blocks[task](z[i : i + 1], y[i : i + 1]))
+                    y = torch.cat(y_list, dim=0)
+                elif model.planning_loop.answer_update_block is not None:
+                    y = model.planning_loop.answer_update_block(z, y)
+                else:
+                    y = y
 
             # prob: [batch_size]
             prob: torch.Tensor = model.q_head(z, y)
