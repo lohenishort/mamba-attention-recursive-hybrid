@@ -207,7 +207,7 @@ def main() -> None:
             correct_mask = is_correct.float()
 
             loss = compute_bce_joint_loss(
-                logits, target_ids, bce_probs, correct_mask, alpha=1.0
+                logits, target_ids, bce_probs, correct_mask, alpha=1.0, ignore_index=0
             )
             loss.backward()  # type: ignore[no-untyped-call]
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -232,7 +232,7 @@ def main() -> None:
                 preds = logits.argmax(dim=-1)
                 is_correct = (preds == target_ids).all(dim=-1)
                 loss = compute_bce_joint_loss(
-                    logits, target_ids, bce_probs, is_correct.float(), alpha=1.0
+                    logits, target_ids, bce_probs, is_correct.float(), alpha=1.0, ignore_index=0
                 )
 
                 val_loss += loss.item() * input_ids.size(0)

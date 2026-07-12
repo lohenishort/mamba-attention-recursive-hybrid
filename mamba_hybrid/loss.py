@@ -11,6 +11,7 @@ def compute_bce_joint_loss(
     bce_probs: list[torch.Tensor],
     correct_mask: torch.Tensor,
     alpha: float = 1.0,
+    ignore_index: int = -100,
 ) -> torch.Tensor:
     """Computes the joint loss combining sparse task CE and BCE halting head loss.
 
@@ -22,6 +23,7 @@ def compute_bce_joint_loss(
         correct_mask: Binary mask indicating whether each sample was answered correctly.
             Shape: [batch_size]
         alpha: Weighting factor for the halting loss component.
+        ignore_index: Token ID to ignore in cross-entropy calculation.
 
     Returns:
         The combined joint loss tensor (scalar).
@@ -32,7 +34,7 @@ def compute_bce_joint_loss(
     # Each prob in bce_probs: [batch_size]
 
     B, L_ans, D = y_final.shape
-    loss_task = F.cross_entropy(y_final.view(-1, D), target_ids.view(-1), ignore_index=0)
+    loss_task = F.cross_entropy(y_final.view(-1, D), target_ids.view(-1), ignore_index=ignore_index)
 
     loss_bce = torch.tensor(0.0, device=y_final.device)
     n_steps = len(bce_probs)
@@ -58,6 +60,7 @@ def compute_q_joint_loss(
     alpha: float = 1.0,
     gamma: float = 1.0,
     states: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ignore_index: int = -100,
 ) -> torch.Tensor:
     """Computes the joint loss combining sparse task CE and Q-learning halting loss.
 
@@ -73,6 +76,7 @@ def compute_q_joint_loss(
         gamma: Discount factor for bootstrapping.
         states: Optional list of tuples (z, y) at each step of the supervision cycle.
             Used for true target network bootstrapping.
+        ignore_index: Token ID to ignore in cross-entropy calculation.
 
     Returns:
         The combined joint loss tensor (scalar).
@@ -82,7 +86,7 @@ def compute_q_joint_loss(
     # correct_mask: [batch_size]
     # Each pred in q_preds: [batch_size, 2]
     B, L_ans, D = y_final.shape
-    loss_task = F.cross_entropy(y_final.view(-1, D), target_ids.view(-1), ignore_index=0)
+    loss_task = F.cross_entropy(y_final.view(-1, D), target_ids.view(-1), ignore_index=ignore_index)
 
     loss_q = torch.tensor(0.0, device=y_final.device)
     n_steps = len(q_preds)

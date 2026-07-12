@@ -150,7 +150,7 @@ def main() -> None:
 
             # Compute joint loss
             loss = compute_bce_joint_loss(
-                logits, target_ids, bce_probs, correct_mask, alpha=1.0
+                logits, target_ids, bce_probs, correct_mask, alpha=1.0, ignore_index=900
             )
 
             loss.backward()  # type: ignore[no-untyped-call]
@@ -176,7 +176,7 @@ def main() -> None:
                 preds = logits.argmax(dim=-1)
                 is_correct = (preds == target_ids).all(dim=-1)
                 loss = compute_bce_joint_loss(
-                    logits, target_ids, bce_probs, is_correct.float(), alpha=1.0
+                    logits, target_ids, bce_probs, is_correct.float(), alpha=1.0, ignore_index=900
                 )
 
                 val_loss += loss.item() * grid_flat.size(0)

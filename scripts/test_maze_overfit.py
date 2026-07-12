@@ -76,7 +76,7 @@ def main() -> None:
             correct_mask = is_correct.float()
 
             loss = compute_bce_joint_loss(
-                logits, target_ids, bce_probs, correct_mask, alpha=1.0
+                logits, target_ids, bce_probs, correct_mask, alpha=1.0, ignore_index=900
             )
             loss.backward()  # type: ignore[no-untyped-call]
             optimizer.step()
