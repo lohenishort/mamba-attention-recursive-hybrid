@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.operators import MambaAttentionHybridBlock
 
@@ -95,7 +96,7 @@ def test_moe_layer_and_block() -> None:
     assert out.shape == (2, 32, 64)
 
     loss = out.sum()
-    loss.backward()  # type: ignore[no-untyped-call]
+    loss.backward()
     assert x.grad is not None
     assert not torch.isnan(x.grad).any()
 
@@ -111,7 +112,9 @@ def test_moe_layer_and_block() -> None:
     assert out_block.shape == (2, 32, 64)
 
     loss_block = out_block.sum()
-    loss_block.backward()  # type: ignore[no-untyped-call]
+    loss_block.backward()
     assert x_block.grad is not None
     # Verify gradient flows to expert parameters
-    assert block.moe.experts["MAZE"][0].weight.grad is not None
+    expert_seq = block.moe.experts["MAZE"]
+    assert isinstance(expert_seq, nn.Sequential)
+    assert expert_seq[0].weight.grad is not None

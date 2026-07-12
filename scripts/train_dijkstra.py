@@ -116,10 +116,10 @@ def main() -> None:
     random.shuffle(all_samples)
     train_size = int(0.8 * len(all_samples))
     train_samples = all_samples[:train_size]
-    val_samples = all_samples[train_size:]
+    val_samples_list = all_samples[train_size:]
 
     train_set = DijkstraDataset(train_samples, augment=True, num_nodes=20, d_model=128)
-    val_set = DijkstraDataset(val_samples, augment=False, num_nodes=20, d_model=128)
+    val_set = DijkstraDataset(val_samples_list, augment=False, num_nodes=20, d_model=128)
 
     train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=32, shuffle=False)

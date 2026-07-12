@@ -115,10 +115,10 @@ def main() -> None:
     random.shuffle(all_samples)
     train_size = int(0.8 * len(all_samples))
     train_samples = all_samples[:train_size]
-    val_samples = all_samples[train_size:]
+    val_samples_list = all_samples[train_size:]
 
     train_set = SudokuDataset(train_samples, augment=True)
-    val_set = SudokuDataset(val_samples, augment=False)
+    val_set = SudokuDataset(val_samples_list, augment=False)
 
     train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=32, shuffle=False)

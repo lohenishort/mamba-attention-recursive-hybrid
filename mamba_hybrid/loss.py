@@ -96,14 +96,11 @@ def compute_q_joint_loss(
                     next_z, next_y = states[t + 1]
                 else:
                     # fallback simulation if states not provided or not fully populated
-                    next_z, next_y = (
-                        q_preds[t + 1]
-                        if isinstance(q_preds[t + 1], tuple)
-                        else (
-                            torch.zeros_like(y_final),
-                            torch.zeros_like(y_final),
-                        )
-                    )
+                    # next_z: [B, n_meta, D], next_y: [B, l_ans, D]
+                    B = y_final.shape[0]
+                    D = y_final.shape[2]
+                    next_z = torch.zeros(B, target_model.n_meta, D, device=y_final.device)
+                    next_y = torch.zeros(B, target_model.l_ans, D, device=y_final.device)
 
                 with torch.no_grad():
                     # target_model.q_head.get_q_values: [batch_size, 2]
