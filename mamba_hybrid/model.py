@@ -108,7 +108,10 @@ class MambaAttentionHybrid(nn.Module):
                 task = task_names[i] if task_names is not None else "MAZE"
                 if task not in self.planning_loop.answer_update_blocks:
                     task = "MAZE"
-                y_list.append(self.planning_loop.answer_update_blocks[task](z[i : i + 1], y[i : i + 1]))
+                from mamba_hybrid.answer_update import AnswerUpdateBlock
+                block = self.planning_loop.answer_update_blocks[task]
+                assert isinstance(block, AnswerUpdateBlock)
+                y_list.append(block(z[i : i + 1], y[i : i + 1]))
             y_final: torch.Tensor = torch.cat(y_list, dim=0)
         elif self.planning_loop.answer_update_block is not None:
             y_final = self.planning_loop.answer_update_block(z, y)
@@ -169,7 +172,10 @@ class MambaAttentionHybrid(nn.Module):
                 task = task_names[i] if task_names is not None else "MAZE"
                 if task not in self.planning_loop.answer_update_blocks:
                     task = "MAZE"
-                y_list.append(self.planning_loop.answer_update_blocks[task](z[i : i + 1], y[i : i + 1]))
+                from mamba_hybrid.answer_update import AnswerUpdateBlock
+                block = self.planning_loop.answer_update_blocks[task]
+                assert isinstance(block, AnswerUpdateBlock)
+                y_list.append(block(z[i : i + 1], y[i : i + 1]))
             y_final: torch.Tensor = torch.cat(y_list, dim=0)
         elif self.planning_loop.answer_update_block is not None:
             y_final = self.planning_loop.answer_update_block(z, y)

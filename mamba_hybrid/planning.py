@@ -23,6 +23,16 @@ class PlanningLoop(nn.Module):
             config
         )
         self.answer_update_block: AnswerUpdateBlock = AnswerUpdateBlock(config)
+        self.answer_update_blocks: nn.ModuleDict | None = None
+        if config.use_moe:
+            self.answer_update_blocks = nn.ModuleDict(
+                {
+                    "MAZE": AnswerUpdateBlock(config),
+                    "SUDOKU": AnswerUpdateBlock(config),
+                    "DIJKSTRA": AnswerUpdateBlock(config),
+                    "GSM8K": AnswerUpdateBlock(config),
+                }
+            )
 
     def forward(
         self,
@@ -61,5 +71,22 @@ class PlanningLoop(nn.Module):
                     X_concat, causal=False, task_names=task_names
                 )[:, : self.n_meta, :]
             # Update the answer state at the end of the cycle: [B, L_ans, D]
-            y = self.answer_update_block(z, y)
+            if self.config.use_moe and self.answer_update_blocks is not None:
+                if task_names is not None:
+                    y_list = []
+                    for i in range(y.shape[0]):
+                        task = task_names[i]
+                        if task not in self.answer_update_blocks:
+                            task = "MAZE"
+                        # Cast to AnswerUpdateBlock to help mypy type inference
+                        block = self.answer_update_blocks[task]
+                        assert isinstance(block, AnswerUpdateBlock)
+                        y_list.append(block(z[i : i + 1], y[i : i + 1]))
+                    y = torch.cat(y_list, dim=0)
+                else:
+                    block = self.answer_update_blocks["MAZE"]
+                    assert isinstance(block, AnswerUpdateBlock)
+                    y = block(z, y)
+            else:
+                y = self.answer_update_block(z, y)
         return z, y
