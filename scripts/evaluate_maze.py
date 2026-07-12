@@ -56,7 +56,11 @@ def main() -> None:
         print("Error: Trained model or dataset not found. Run train_maze first.")
         return
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "xpu"
+        if hasattr(torch, "xpu") and torch.xpu.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     print(f"Loading test environment on {device}...")
 
     # Initialize config (must match training parameters)

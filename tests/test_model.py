@@ -34,10 +34,12 @@ def test_init_answer() -> None:
     # Verify that the value is correct: average pooled x_raw passed through linear projection
     pooled: torch.Tensor = x_raw.mean(dim=1)  # [batch_size, d_model]
     expected_proj: torch.Tensor = model.ans_init_proj(pooled)  # [batch_size, d_model]
-    # Check that each position along the sequence dim matches expected_proj
+    # Check that each position along the sequence dim matches expected_proj + y_pos_embed
     i: int
     for i in range(12):
-        assert torch.allclose(ans_init[:, i, :], expected_proj, atol=1e-5)
+        assert torch.allclose(ans_init[:, i, :], expected_proj + model.y_pos_embed[:, i, :], atol=1e-5)
+        # Verify that positional embedding broke the symmetry (not equal to expected_proj alone)
+        assert not torch.allclose(ans_init[:, i, :], expected_proj, atol=1e-5)
 
 
 def test_model_determinism() -> None:
@@ -111,6 +113,7 @@ def test_model_gradients() -> None:
 
     # With t_cycles > 1, warmup cycles run in no_grad, so gradients do NOT flow back to initialization parameters
     assert model_warmup.M_meta.grad is None
+    assert model_warmup.y_pos_embed.grad is None
     assert model_warmup.ans_init_proj.weight.grad is None
     assert model_warmup.ans_init_proj.bias.grad is None
 
@@ -146,6 +149,7 @@ def test_model_gradients() -> None:
 
     # With t_cycles = 1, gradients must flow back to initialization parameters
     assert model_no_warmup.M_meta.grad is not None
+    assert model_no_warmup.y_pos_embed.grad is not None
     assert model_no_warmup.ans_init_proj.weight.grad is not None
     assert model_no_warmup.ans_init_proj.bias.grad is not None
 

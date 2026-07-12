@@ -24,7 +24,11 @@ def main() -> None:
         print("Error: Trained model not found. Run train_multitask first.")
         return
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "xpu"
+        if hasattr(torch, "xpu") and torch.xpu.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     print(f"Loading Multi-Task Evaluation Environment on {device}...")
 
     # Load checkpoint and extract config / state_dict

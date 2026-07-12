@@ -149,7 +149,11 @@ class UnifiedReasoningLLM(nn.Module):
 def main() -> None:
     data_dir = "data"
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "xpu"
+        if hasattr(torch, "xpu") and torch.xpu.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     print(f"Using device: {device}")
 
     # Set up config with max answer length (128 for GSM8K)

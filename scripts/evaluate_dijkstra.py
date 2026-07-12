@@ -26,7 +26,11 @@ def main() -> None:
         print("Error: Trained model or dataset not found. Run train_dijkstra first.")
         return
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "xpu"
+        if hasattr(torch, "xpu") and torch.xpu.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     print(f"Loading Dijkstra Evaluation Environment on {device}...")
 
     # Load checkpoint and config

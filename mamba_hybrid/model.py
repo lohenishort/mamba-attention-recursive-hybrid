@@ -29,6 +29,11 @@ class MambaAttentionHybrid(nn.Module):
             torch.randn(1, self.n_meta, self.d_model)
         )
 
+        # Positional embedding for the answer sequence y to break symmetry
+        self.y_pos_embed: nn.Parameter = nn.Parameter(
+            torch.randn(1, self.l_ans, self.d_model)
+        )
+
         # Projection layer to initialize answer representation from pooled input context
         self.ans_init_proj: nn.Linear = nn.Linear(self.d_model, self.d_model)
 
@@ -50,6 +55,7 @@ class MambaAttentionHybrid(nn.Module):
         ans_init: torch.Tensor = (
             self.ans_init_proj(pooled).unsqueeze(1).expand(-1, self.l_ans, -1)
         )  # [batch_size, l_ans, d_model]
+        ans_init = ans_init + self.y_pos_embed
         return ans_init
 
     def forward(
@@ -96,9 +102,18 @@ class MambaAttentionHybrid(nn.Module):
             bce_prob: torch.Tensor = self.q_head(z, y)  # [batch_size]
             bce_probs.append(bce_prob)
 
-        y_final: torch.Tensor = self.planning_loop.answer_update_block(
-            z, y
-        )  # [batch_size, l_ans, d_model]
+        if self.planning_loop.config.use_moe and self.planning_loop.answer_update_blocks is not None:
+            y_list = []
+            for i in range(y.shape[0]):
+                task = task_names[i] if task_names is not None else "MAZE"
+                if task not in self.planning_loop.answer_update_blocks:
+                    task = "MAZE"
+                y_list.append(self.planning_loop.answer_update_blocks[task](z[i : i + 1], y[i : i + 1]))
+            y_final: torch.Tensor = torch.cat(y_list, dim=0)
+        elif self.planning_loop.answer_update_block is not None:
+            y_final = self.planning_loop.answer_update_block(z, y)
+        else:
+            y_final = y
         return y_final, bce_probs
 
     def forward_q(
@@ -148,7 +163,16 @@ class MambaAttentionHybrid(nn.Module):
             q_preds.append(q_vals)
             states.append((z, y))
 
-        y_final: torch.Tensor = self.planning_loop.answer_update_block(
-            z, y
-        )  # [batch_size, l_ans, d_model]
+        if self.planning_loop.config.use_moe and self.planning_loop.answer_update_blocks is not None:
+            y_list = []
+            for i in range(y.shape[0]):
+                task = task_names[i] if task_names is not None else "MAZE"
+                if task not in self.planning_loop.answer_update_blocks:
+                    task = "MAZE"
+                y_list.append(self.planning_loop.answer_update_blocks[task](z[i : i + 1], y[i : i + 1]))
+            y_final: torch.Tensor = torch.cat(y_list, dim=0)
+        elif self.planning_loop.answer_update_block is not None:
+            y_final = self.planning_loop.answer_update_block(z, y)
+        else:
+            y_final = y
         return y_final, states, q_preds
