@@ -1,4 +1,4 @@
-from typing import cast
+from typing import cast, List
 import torch
 import torch.nn as nn
 from mamba_hybrid.config import MambaHybridConfig
@@ -21,6 +21,65 @@ class RMSNorm(nn.Module):
         variance: torch.Tensor = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
         # return: [..., d_model]
         return (x * torch.rsqrt(variance + self.eps).to(x.dtype)) * self.weight
+
+
+class TaskPrefixedMoeLayer(nn.Module):
+    """
+    Mixture of Experts (MoE) Layer routed deterministically by task prefix.
+    """
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.d_model: int = d_model
+
+        # FFN expert MLPs for each task
+        self.experts: nn.ModuleDict = nn.ModuleDict(
+            {
+                "MAZE": nn.Sequential(
+                    nn.Linear(d_model, 4 * d_model),
+                    nn.SiLU(),
+                    nn.Linear(4 * d_model, d_model),
+                ),
+                "SUDOKU": nn.Sequential(
+                    nn.Linear(d_model, 4 * d_model),
+                    nn.SiLU(),
+                    nn.Linear(4 * d_model, d_model),
+                ),
+                "DIJKSTRA": nn.Sequential(
+                    nn.Linear(d_model, 4 * d_model),
+                    nn.SiLU(),
+                    nn.Linear(4 * d_model, d_model),
+                ),
+                "GSM8K": nn.Sequential(
+                    nn.Linear(d_model, 4 * d_model),
+                    nn.SiLU(),
+                    nn.Linear(4 * d_model, d_model),
+                ),
+            }
+        )
+
+    def forward(
+        self, x: torch.Tensor, task_names: List[str] | None = None
+    ) -> torch.Tensor:
+        # x shape: [B, L, D]
+        B, L, D = x.shape
+
+        if task_names is None:
+            # Fallback to MAZE expert if no task_names are provided (e.g. in tests/single-task runs)
+            task_names = ["MAZE"] * B
+
+        out_list = []
+        for i in range(B):
+            task = task_names[i]
+            # If the task name is not registered, fallback to MAZE
+            if task in self.experts:
+                expert = self.experts[task]
+            else:
+                expert = self.experts["MAZE"]
+            out_sample = expert(x[i])
+            out_list.append(out_sample)
+
+        return torch.stack(out_list, dim=0)
 
 
 class MambaAttentionHybridBlock(nn.Module):
@@ -55,13 +114,24 @@ class MambaAttentionHybridBlock(nn.Module):
         self.norm_ssm: RMSNorm = RMSNorm(self.d_model)
         self.out_proj: nn.Linear = nn.Linear(self.d_model, self.d_model, bias=False)
 
-    def forward(self, x: torch.Tensor, causal: bool = False) -> torch.Tensor:
+        # Mixture of Experts FFN layer
+        self.moe: TaskPrefixedMoeLayer | None = None
+        if config.use_moe:
+            self.moe = TaskPrefixedMoeLayer(self.d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        causal: bool = False,
+        task_names: List[str] | None = None,
+    ) -> torch.Tensor:
         """
         Forward pass for the hybrid block.
 
         Args:
             x: Input feature tensor of shape [B, L, D]
             causal: Whether to apply prefix-causal attention masking.
+            task_names: Optional task prefix names for MoE routing.
 
         Returns:
             Output tensor of shape [B, L, D]
@@ -115,6 +185,10 @@ class MambaAttentionHybridBlock(nn.Module):
         y_fused: torch.Tensor = (
             (hat_y_attn * self.beta_1) + (hat_y_ssm * self.beta_2)
         ) / 2
+
+        # Apply Mixture of Experts FFN if enabled
+        if self.moe is not None:
+            y_fused = self.moe(y_fused, task_names)
 
         # Final projection and residual connection
         # return shape: [B, L, D]

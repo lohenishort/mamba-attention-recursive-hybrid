@@ -35,13 +35,11 @@ def main() -> None:
         and "config" in checkpoint
     ):
         config_dict = checkpoint["config"]
-        config = MambaHybridConfig(
-            d_model=config_dict.get("d_model", 64),
-            n_meta=config_dict.get("n_meta", 16),
-            l_ans=config_dict.get("l_ans", 128),
-            n_steps=config_dict.get("n_steps", 2),
-            t_cycles=config_dict.get("t_cycles", 2),
-        )
+        import inspect
+        sig = inspect.signature(MambaHybridConfig.__init__)
+        valid_keys = {k for k in sig.parameters.keys() if k != "self"}
+        filtered_config = {k: v for k, v in config_dict.items() if k in valid_keys}
+        config = MambaHybridConfig(**filtered_config)
         state_dict = checkpoint["state_dict"]
     else:
         state_dict = checkpoint

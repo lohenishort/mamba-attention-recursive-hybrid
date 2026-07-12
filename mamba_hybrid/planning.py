@@ -2,6 +2,7 @@ import contextlib
 
 import torch
 import torch.nn as nn
+from typing import List
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.operators import MambaAttentionHybridBlock
 from mamba_hybrid.answer_update import AnswerUpdateBlock
@@ -29,6 +30,7 @@ class PlanningLoop(nn.Module):
         z: torch.Tensor,
         y: torch.Tensor,
         warmup: bool = True,
+        task_names: List[str] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the planning loop cycle.
@@ -55,7 +57,9 @@ class PlanningLoop(nn.Module):
                 X_concat = torch.cat([z, y, x_raw], dim=1)
                 # Apply non-causal attention to propagate constraints globally
                 # Slice out the updated latent state z: [B, N_meta, D]
-                z = self.planning_block(X_concat, causal=False)[:, : self.n_meta, :]
+                z = self.planning_block(
+                    X_concat, causal=False, task_names=task_names
+                )[:, : self.n_meta, :]
             # Update the answer state at the end of the cycle: [B, L_ans, D]
             y = self.answer_update_block(z, y)
         return z, y

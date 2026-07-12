@@ -83,3 +83,35 @@ def test_hybrid_block_causal() -> None:
     assert block.ssm_branch.out_proj.weight.grad is not None
     assert block.beta_1.grad is not None
     assert block.beta_2.grad is not None
+
+
+def test_moe_layer_and_block() -> None:
+    from mamba_hybrid.operators import TaskPrefixedMoeLayer
+
+    # 1. Test TaskPrefixedMoeLayer shape & gradient flow
+    moe = TaskPrefixedMoeLayer(d_model=64)
+    x = torch.randn(2, 32, 64, requires_grad=True)
+    out = moe(x, task_names=["MAZE", "SUDOKU"])
+    assert out.shape == (2, 32, 64)
+
+    loss = out.sum()
+    loss.backward()  # type: ignore[no-untyped-call]
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
+
+    # 2. Test MambaAttentionHybridBlock with MoE enabled
+    config = MambaHybridConfig(
+        d_model=64, n_meta=16, use_moe=True
+    )
+    block = MambaAttentionHybridBlock(config)
+    assert block.moe is not None
+
+    x_block = torch.randn(2, 32, 64, requires_grad=True)
+    out_block = block(x_block, causal=False, task_names=["MAZE", "SUDOKU"])
+    assert out_block.shape == (2, 32, 64)
+
+    loss_block = out_block.sum()
+    loss_block.backward()  # type: ignore[no-untyped-call]
+    assert x_block.grad is not None
+    # Verify gradient flows to expert parameters
+    assert block.moe.experts["MAZE"][0].weight.grad is not None

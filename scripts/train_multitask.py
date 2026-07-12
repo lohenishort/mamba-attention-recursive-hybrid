@@ -131,7 +131,7 @@ class UnifiedReasoningLLM(nn.Module):
         # input_ids shape: [B, L_raw]
         B = input_ids.shape[0]
         X_raw = self.embed(input_ids)  # [B, L_raw, D]
-        y_final, bce_probs = self.reasoning_encoder(X_raw)  # [B, l_ans, D]
+        y_final, bce_probs = self.reasoning_encoder(X_raw, task_names=task_names)  # [B, l_ans, D]
 
         # Route each sample in the batch to its respective task-specific head
         logits_list = []
@@ -155,7 +155,7 @@ def main() -> None:
     # Set up config with max answer length (128 for GSM8K)
     l_ans = 128
     config = MambaHybridConfig(
-        d_model=64, n_meta=16, l_ans=l_ans, n_steps=2, t_cycles=2
+        d_model=64, n_meta=16, l_ans=l_ans, n_steps=2, t_cycles=2, use_moe=True
     )
 
     # Initialize Dataset (load 100 samples per task to train fast on CPU)

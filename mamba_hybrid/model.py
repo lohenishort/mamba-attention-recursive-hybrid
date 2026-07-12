@@ -1,3 +1,4 @@
+from typing import List
 import torch
 import torch.nn as nn
 from mamba_hybrid.config import MambaHybridConfig
@@ -51,12 +52,15 @@ class MambaAttentionHybrid(nn.Module):
         )  # [batch_size, l_ans, d_model]
         return ans_init
 
-    def forward(self, X_raw: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    def forward(
+        self, X_raw: torch.Tensor, task_names: List[str] | None = None
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Forward pass coordinating warmup loops and the final supervision loop.
 
         Args:
             X_raw: Raw input context of shape [B, L_raw, D]
+            task_names: Optional task prefix names for MoE routing.
 
         Returns:
             y_final: Final updated answer prediction state of shape [B, L_ans, D]
@@ -69,7 +73,7 @@ class MambaAttentionHybrid(nn.Module):
 
         # Warmup phase (T-1 cycles, no grad)
         for c in range(1, self.t_cycles):
-            z, y = self.planning_loop(X_raw, z, y, warmup=True)
+            z, y = self.planning_loop(X_raw, z, y, warmup=True, task_names=task_names)
 
         # Supervision cycle (T cycle, grad enabled)
 
@@ -79,9 +83,9 @@ class MambaAttentionHybrid(nn.Module):
             X_concat: torch.Tensor = torch.cat(
                 [z, y, X_raw], dim=1
             )  # [batch_size, n_meta + l_ans + seq_len, d_model]
-            z = self.planning_loop.planning_block(X_concat, causal=False)[
-                :, : self.n_meta, :
-            ]  # [batch_size, n_meta, d_model]
+            z = self.planning_loop.planning_block(
+                X_concat, causal=False, task_names=task_names
+            )[:, : self.n_meta, :]  # [batch_size, n_meta, d_model]
 
             # Regularization training noise
             if self.training and torch.rand(1).item() < 0.15:
@@ -98,7 +102,7 @@ class MambaAttentionHybrid(nn.Module):
         return y_final, bce_probs
 
     def forward_q(
-        self, X_raw: torch.Tensor
+        self, X_raw: torch.Tensor, task_names: List[str] | None = None
     ) -> tuple[
         torch.Tensor,
         list[tuple[torch.Tensor, torch.Tensor]],
@@ -108,6 +112,7 @@ class MambaAttentionHybrid(nn.Module):
 
         Args:
             X_raw: Raw input context of shape [B, L_raw, D]
+            task_names: Optional task prefix names for MoE routing.
 
         Returns:
             y_final: Final updated answer prediction state of shape [B, L_ans, D]
@@ -121,7 +126,7 @@ class MambaAttentionHybrid(nn.Module):
 
         # Warmup phase (T-1 cycles, no grad)
         for c in range(1, self.t_cycles):
-            z, y = self.planning_loop(X_raw, z, y, warmup=True)
+            z, y = self.planning_loop(X_raw, z, y, warmup=True, task_names=task_names)
 
         # Supervision cycle (T cycle, grad enabled)
         if self.training:
@@ -135,9 +140,9 @@ class MambaAttentionHybrid(nn.Module):
             X_concat: torch.Tensor = torch.cat(
                 [z, y, X_raw], dim=1
             )  # [batch_size, n_meta + l_ans + seq_len, d_model]
-            z = self.planning_loop.planning_block(X_concat, causal=False)[
-                :, : self.n_meta, :
-            ]  # [batch_size, n_meta, d_model]
+            z = self.planning_loop.planning_block(
+                X_concat, causal=False, task_names=task_names
+            )[:, : self.n_meta, :]  # [batch_size, n_meta, d_model]
 
             q_vals: torch.Tensor = self.q_head.get_q_values(z, y)  # [batch_size, 2]
             q_preds.append(q_vals)
