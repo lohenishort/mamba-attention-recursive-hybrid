@@ -39,8 +39,10 @@ def main() -> None:
     val_size = len(dataset) - train_size
     train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=32, shuffle=False)
+    batch_size = 8
+    accumulation_steps = 4
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
     # Initialize model & optimizer
     model = MazeReasoningModel(config, grid_size=30).to(device)
@@ -56,25 +58,29 @@ def main() -> None:
         total_loss = 0.0
         correct_count = 0
         total_samples = 0
+        optimizer.zero_grad()
 
-        for grid_flat, target_ids in train_loader:
+        for step, (grid_flat, target_ids) in enumerate(train_loader, 1):
             grid_flat, target_ids = grid_flat.to(device), target_ids.to(device)
-            optimizer.zero_grad()
 
-            logits, bce_probs = model(grid_flat)
+            with torch.amp.autocast(device_type=device.type):
+                logits, bce_probs = model(grid_flat)
+
             preds = logits.argmax(dim=-1)
             is_correct = (preds == target_ids).all(dim=-1)
             correct_mask = is_correct.float()
-
             loss = compute_bce_joint_loss(
                 logits, target_ids, bce_probs, correct_mask, alpha=1.0
-            )
+            ) / accumulation_steps
 
             loss.backward()  # type: ignore[no-untyped-call]
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
 
-            total_loss += loss.item() * grid_flat.size(0)
+            if step % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            total_loss += loss.item() * grid_flat.size(0) * accumulation_steps
             correct_count += is_correct.sum().item()
             total_samples += grid_flat.size(0)
 
