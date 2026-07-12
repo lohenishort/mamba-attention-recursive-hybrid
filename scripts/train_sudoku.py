@@ -103,7 +103,7 @@ def main() -> None:
     with open(data_path, "r") as f:
         for line in f:
             all_samples.append(json.loads(line))
-            if len(all_samples) >= 1000:
+            if len(all_samples) >= 50000:
                 break
 
     # Shuffle and split
@@ -123,7 +123,7 @@ def main() -> None:
     model = SudokuReasoningModel(config, vocab_size=10).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
 
-    epochs = 20
+    epochs = 100
     print(f"Starting training on {len(train_set)} Sudoku puzzles...")
     for epoch in range(1, epochs + 1):
         model.train()
