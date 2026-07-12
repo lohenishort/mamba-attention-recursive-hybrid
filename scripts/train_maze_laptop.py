@@ -39,8 +39,8 @@ def main() -> None:
     val_size = len(dataset) - train_size
     train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    batch_size = 8
-    accumulation_steps = 4
+    batch_size = 4
+    accumulation_steps = 8
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 

@@ -180,8 +180,8 @@ def main() -> None:
     val_size = len(dataset) - train_size
     train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=32, shuffle=False)
+    train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=16, shuffle=False)
 
     # Initialize Unified Model
     model = UnifiedReasoningLLM(config, vocab_size=128).to(device)
