@@ -113,6 +113,8 @@ class UnifiedReasoningLLM(nn.Module):
         super().__init__()
         self.config = config
         self.embed = nn.Embedding(vocab_size, config.d_model)
+        # Learnable 1D positional embeddings for input context
+        self.pos_embed = nn.Parameter(torch.randn(1, 128, config.d_model))
         self.reasoning_encoder = MambaAttentionHybrid(config)
 
         # Task-specific projection heads to prevent multi-task representation interference
@@ -130,7 +132,7 @@ class UnifiedReasoningLLM(nn.Module):
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         # input_ids shape: [B, L_raw]
         B = input_ids.shape[0]
-        X_raw = self.embed(input_ids)  # [B, L_raw, D]
+        X_raw = self.embed(input_ids) + self.pos_embed[:, :input_ids.shape[1], :]  # [B, L_raw, D]
         y_final, bce_probs = self.reasoning_encoder(X_raw, task_names=task_names)  # [B, l_ans, D]
 
         # Route each sample in the batch to its respective task-specific head
