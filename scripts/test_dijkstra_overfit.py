@@ -45,8 +45,8 @@ def main() -> None:
     model = DijkstraReasoningModel(config, vocab_size=20).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)
 
-    print("Starting overfit training for 150 epochs...")
-    for epoch in range(1, 151):
+    print("Starting overfit training for 300 epochs...")
+    for epoch in range(1, 301):
         model.train()
         total_loss = 0.0
         correct_nodes = 0
@@ -76,7 +76,7 @@ def main() -> None:
 
         avg_loss = total_loss / len(dataset)
         acc = (correct_nodes / total_nodes) * 100
-        if epoch % 15 == 0 or epoch == 1:
+        if epoch % 30 == 0 or epoch == 1:
             print(
                 f"Epoch {epoch:03d} | Loss: {avg_loss:.4f} | Parent Match Acc: {acc:.2f}%"
             )
