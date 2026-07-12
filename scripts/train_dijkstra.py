@@ -76,11 +76,13 @@ class DijkstraReasoningModel(nn.Module):
     def __init__(self, config: MambaHybridConfig, vocab_size: int = 20) -> None:
         super().__init__()
         self.config = config
+        self.pos_embed = nn.Parameter(torch.randn(1, 20, config.d_model))
         self.reasoning_encoder = MambaAttentionHybrid(config)
         self.token_generator = nn.Linear(config.d_model, vocab_size)
 
     def forward(self, X_raw: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         # X_raw shape: [B, 20, D] (continuous graph adjacency rows)
+        X_raw = X_raw + self.pos_embed
         y_final, bce_probs = self.reasoning_encoder(X_raw)  # [B, 20, D]
         logits = self.token_generator(y_final)  # [B, 20, vocab_size]
         return logits, bce_probs

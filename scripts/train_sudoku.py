@@ -69,6 +69,9 @@ class SudokuReasoningModel(nn.Module):
         super().__init__()
         self.config = config
         self.embed = nn.Embedding(vocab_size, config.d_model)
+        # 2D row & col positional embeddings
+        self.row_embed = nn.Parameter(torch.randn(9, config.d_model // 2))
+        self.col_embed = nn.Parameter(torch.randn(9, config.d_model // 2))
         self.reasoning_encoder = MambaAttentionHybrid(config)
         self.token_generator = nn.Linear(config.d_model, vocab_size)
 
@@ -76,7 +79,12 @@ class SudokuReasoningModel(nn.Module):
         self, input_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         # input_ids shape: [B, 81]
-        X_raw = self.embed(input_ids)  # [B, 81, D]
+        B = input_ids.size(0)
+        row_pos = self.row_embed.unsqueeze(1).expand(-1, 9, -1)  # [9, 9, D // 2]
+        col_pos = self.col_embed.unsqueeze(0).expand(9, -1, -1)  # [9, 9, D // 2]
+        pos_2d = torch.cat([row_pos, col_pos], dim=-1).view(81, -1).unsqueeze(0).expand(B, -1, -1)
+        
+        X_raw = self.embed(input_ids) + pos_2d  # [B, 81, D]
         y_final, bce_probs = self.reasoning_encoder(X_raw)  # [B, 81, D]
         logits = self.token_generator(y_final)  # [B, 81, vocab_size]
         return logits, bce_probs
