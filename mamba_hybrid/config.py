@@ -13,3 +13,6 @@ class MambaHybridConfig:
     use_cuda_kernels: bool = False
     M_min: int = 1
     M_max: int = 6
+    use_moe: bool = False
+    num_experts: int = 4
+    moe_top_k: int = 1
