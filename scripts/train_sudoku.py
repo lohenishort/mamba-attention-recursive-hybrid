@@ -181,16 +181,16 @@ def main() -> None:
         val_acc = val_correct / val_samples
 
         print(
-            f"Epoch {epoch:02d}/{epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            f"Epoch {epoch:02d}/{epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}",
+            flush=True
         )
 
-    # Save the model
-    os.makedirs("data", exist_ok=True)
-    torch.save(
-        {"state_dict": model.state_dict(), "config": vars(config)},
-        "data/sudoku_model.pt",
-    )
-    print("Successfully saved trained model state dict to data/sudoku_model.pt")
+        # Save checkpoint at the end of each epoch to prevent data loss
+        os.makedirs("data", exist_ok=True)
+        torch.save(
+            {"state_dict": model.state_dict(), "config": vars(config)},
+            "data/sudoku_model.pt",
+        )
 
 
 if __name__ == "__main__":
