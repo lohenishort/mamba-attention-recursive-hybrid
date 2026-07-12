@@ -10,19 +10,38 @@ from mamba_hybrid.loss import compute_bce_joint_loss
 
 
 # --- 1. Custom Dataset for Dijkstra ---
+import random
+
+def augment_dijkstra(adj: List[List[float]], parents: List[int]) -> Tuple[List[List[float]], List[int]]:
+    N = len(adj)
+    perm = list(range(N))
+    random.shuffle(perm)
+    
+    new_adj = [[0.0] * N for _ in range(N)]
+    for i in range(N):
+        for j in range(N):
+            new_adj[perm[i]][perm[j]] = adj[i][j]
+            
+    new_parents = [-1] * N
+    for i in range(N):
+        p = parents[i]
+        if p != -1:
+            new_parents[perm[i]] = perm[p]
+            
+    return new_adj, new_parents
+
 class DijkstraDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
     def __init__(
         self,
-        pt_path: str,
-        max_samples: int = 1000,
+        samples: List[Dict[str, Any]],
+        augment: bool = False,
         num_nodes: int = 20,
         d_model: int = 128,
     ) -> None:
-        self.samples: List[Dict[str, Any]] = []
+        self.samples = samples
+        self.augment = augment
         self.num_nodes = num_nodes
         self.d_model = d_model
-        if os.path.exists(pt_path):
-            self.samples = torch.load(pt_path)[:max_samples]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -32,15 +51,16 @@ class DijkstraDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
         adj = sample["adjacency"]  # [num_nodes, num_nodes]
         parents = sample["parents"]  # [num_nodes]
 
+        if self.augment:
+            adj, parents = augment_dijkstra(adj, parents)
+
         # Convert adjacency to continuous features: [num_nodes, d_model]
-        # Pad each node's row of length 20 to d_model with zeros
         features = torch.zeros(self.num_nodes, self.d_model)
         for i in range(self.num_nodes):
             row = adj[i]
             features[i, : len(row)] = torch.tensor(row, dtype=torch.float32)
 
         # Target: parents representation [num_nodes]
-        # Map parent -1 (unreachable/source node) to 0 (or self-loop)
         target = []
         for i, p in enumerate(parents):
             if p == -1:
@@ -82,11 +102,20 @@ def main() -> None:
         d_model=128, n_meta=32, l_ans=l_ans, n_steps=4, t_cycles=3
     )
 
-    # Initialize dataset & loader
-    dataset = DijkstraDataset(data_path, max_samples=1000, num_nodes=20, d_model=128)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+    # Load all Dijkstra samples
+    all_samples: List[Dict[str, Any]] = []
+    if os.path.exists(data_path):
+        all_samples = torch.load(data_path)[:1000]
+
+    # Shuffle and split
+    random.seed(42)
+    random.shuffle(all_samples)
+    train_size = int(0.8 * len(all_samples))
+    train_samples = all_samples[:train_size]
+    val_samples = all_samples[train_size:]
+
+    train_set = DijkstraDataset(train_samples, augment=True, num_nodes=20, d_model=128)
+    val_set = DijkstraDataset(val_samples, augment=False, num_nodes=20, d_model=128)
 
     train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=32, shuffle=False)

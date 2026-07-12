@@ -11,15 +11,40 @@ from mamba_hybrid.loss import compute_bce_joint_loss
 
 
 # --- 1. Custom Dataset for Sudoku ---
+import random
+
+def augment_sudoku(puzzle: List[List[int]], solution: List[List[int]]) -> Tuple[List[int], List[int]]:
+    # 1. Permute numbers 1-9
+    digits = list(range(1, 10))
+    shuffled = digits.copy()
+    random.shuffle(shuffled)
+    mapping = {i: shuffled[i-1] for i in range(1, 10)}
+    mapping[0] = 0
+    
+    p_grid = [[mapping[val] for val in row] for row in puzzle]
+    s_grid = [[mapping[val] for val in row] for row in solution]
+    
+    # 2. Transposition (50% chance)
+    if random.random() < 0.5:
+        p_grid = [list(x) for x in zip(*p_grid)]
+        s_grid = [list(x) for x in zip(*s_grid)]
+        
+    # 3. Flips (horizontal / vertical)
+    if random.random() < 0.5:
+        p_grid = p_grid[::-1]
+        s_grid = s_grid[::-1]
+    if random.random() < 0.5:
+        p_grid = [row[::-1] for row in p_grid]
+        s_grid = [row[::-1] for row in s_grid]
+        
+    p_flat = [val for row in p_grid for val in row]
+    s_flat = [val for row in s_grid for val in row]
+    return p_flat, s_flat
+
 class SudokuDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
-    def __init__(self, jsonl_path: str, max_samples: int = 1000) -> None:
-        self.samples: List[Dict[str, Any]] = []
-        if os.path.exists(jsonl_path):
-            with open(jsonl_path, "r") as f:
-                for line in f:
-                    self.samples.append(json.loads(line))
-                    if len(self.samples) >= max_samples:
-                        break
+    def __init__(self, samples: List[Dict[str, Any]], augment: bool = False) -> None:
+        self.samples = samples
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -28,14 +53,14 @@ class SudokuDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
         sample = self.samples[idx]
         puzzle = sample["puzzle"]  # 9x9 list of ints
         solution = sample["solution"]  # 9x9 list of ints
-
-        # Flatten puzzle and solution to 81-element 1D tensors
-        puzzle_flat = [val for row in puzzle for val in row]
-        solution_flat = [val for row in solution for val in row]
-
-        return torch.tensor(puzzle_flat, dtype=torch.long), torch.tensor(
-            solution_flat, dtype=torch.long
-        )
+        
+        if self.augment:
+            puzzle_flat, solution_flat = augment_sudoku(puzzle, solution)
+        else:
+            puzzle_flat = [val for row in puzzle for val in row]
+            solution_flat = [val for row in solution for val in row]
+        
+        return torch.tensor(puzzle_flat, dtype=torch.long), torch.tensor(solution_flat, dtype=torch.long)
 
 
 # --- 2. Sudoku Reasoning Model ---
@@ -73,11 +98,23 @@ def main() -> None:
         d_model=128, n_meta=32, l_ans=l_ans, n_steps=4, t_cycles=3
     )
 
-    # Initialize dataset & loader
-    dataset = SudokuDataset(data_path, max_samples=1000)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+    # Load all Sudoku samples
+    all_samples: List[Dict[str, Any]] = []
+    with open(data_path, "r") as f:
+        for line in f:
+            all_samples.append(json.loads(line))
+            if len(all_samples) >= 1000:
+                break
+
+    # Shuffle and split
+    random.seed(42)
+    random.shuffle(all_samples)
+    train_size = int(0.8 * len(all_samples))
+    train_samples = all_samples[:train_size]
+    val_samples = all_samples[train_size:]
+
+    train_set = SudokuDataset(train_samples, augment=True)
+    val_set = SudokuDataset(val_samples, augment=False)
 
     train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=32, shuffle=False)

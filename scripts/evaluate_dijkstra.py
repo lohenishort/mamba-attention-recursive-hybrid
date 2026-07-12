@@ -46,7 +46,10 @@ def main() -> None:
     model.eval()
 
     # Load dataset
-    dataset = DijkstraDataset(data_path, max_samples=10, num_nodes=20, d_model=128)
+    samples = []
+    if os.path.exists(data_path):
+        samples = torch.load(data_path)[:10]
+    dataset = DijkstraDataset(samples, augment=False, num_nodes=20, d_model=128)
 
     # Run evaluation on the first sample
     input_feats, target_ids = dataset[0]

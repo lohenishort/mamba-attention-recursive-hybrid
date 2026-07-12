@@ -48,7 +48,14 @@ def main() -> None:
     model.eval()
 
     # Load dataset
-    dataset = SudokuDataset(data_path, max_samples=10)
+    import json
+    samples = []
+    with open(data_path, "r") as f:
+        for line in f:
+            samples.append(json.loads(line))
+            if len(samples) >= 10:
+                break
+    dataset = SudokuDataset(samples, augment=False)
 
     # Run evaluation on the first sample
     input_ids, target_ids = dataset[0]
