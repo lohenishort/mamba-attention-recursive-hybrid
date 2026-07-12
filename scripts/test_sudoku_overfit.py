@@ -15,19 +15,19 @@ def main() -> None:
         print(f"Error: {data_path} not found.")
         return
 
-    # Load first 100 samples
+    # Load first 5 samples
     samples: List[Dict[str, Any]] = []
     with open(data_path, "r") as f:
         for line in f:
             samples.append(json.loads(line))
-            if len(samples) >= 100:
+            if len(samples) >= 5:
                 break
 
     # We use a smaller model for fast overfit testing
     config = MambaHybridConfig(d_model=64, n_meta=16, l_ans=81, n_steps=2, t_cycles=2)
 
     dataset = SudokuDataset(samples, augment=False)
-    loader = DataLoader(dataset, batch_size=10, shuffle=False)
+    loader = DataLoader(dataset, batch_size=5, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Overfit test device: {device}")
@@ -35,8 +35,8 @@ def main() -> None:
     model = SudokuReasoningModel(config, vocab_size=10).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)
 
-    print("Starting overfit training for 60 epochs...")
-    for epoch in range(1, 61):
+    print("Starting overfit training for 200 epochs...")
+    for epoch in range(1, 201):
         model.train()
         total_loss = 0.0
         correct_cells = 0
@@ -66,8 +66,8 @@ def main() -> None:
 
         avg_loss = total_loss / len(dataset)
         acc = (correct_cells / total_cells) * 100
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch {epoch:02d} | Loss: {avg_loss:.4f} | Cell Acc: {acc:.2f}%")
+        if epoch % 20 == 0 or epoch == 1:
+            print(f"Epoch {epoch:03d} | Loss: {avg_loss:.4f} | Cell Acc: {acc:.2f}%")
 
     # Evaluate final predictions on first sample
     model.eval()
