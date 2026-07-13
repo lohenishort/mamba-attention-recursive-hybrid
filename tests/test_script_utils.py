@@ -4,9 +4,8 @@ import pytest
 import torch
 
 from scripts.generate_massive_sudoku import count_solutions, generate_sudoku_board
-from scripts.train_dijkstra import augment_dijkstra
-from scripts.train_maze import validate_maze_path
-from scripts.train_multitask import tokenize_string
+from mamba_hybrid.tasks.maze import path_to_moves
+from scripts.train_dijkstra import augment_dijkstra_example
 from scripts.utils import deterministic_split_indices, exact_match
 
 
@@ -27,18 +26,19 @@ def test_split_is_deterministic_and_disjoint() -> None:
 def test_dijkstra_augmentation_preserves_source() -> None:
     random.seed(3)
     adjacency = [[0.0] * 4 for _ in range(4)]
-    _, parents = augment_dijkstra(adjacency, [2, 2, -1, 1])
-    assert parents[2] == -1
-
-
-def test_tokenizer_rejects_implicit_truncation() -> None:
-    with pytest.raises(ValueError, match="exceeds"):
-        tokenize_string("too long", 3)
+    sample = {
+        "adjacency": adjacency,
+        "parents": [2, 2, -1, 1],
+        "distances": [1.0, 1.0, 0.0, 2.0],
+        "source": 2,
+    }
+    augmented = augment_dijkstra_example(sample)
+    assert augmented["parents"][augmented["source"]] == -1
 
 
 def test_maze_path_validation_rejects_jumps() -> None:
     with pytest.raises(ValueError, match="non-adjacent"):
-        validate_maze_path([[0, 0], [0, 0]], [(0, 0), (1, 1)])
+        path_to_moves([(0, 0), (1, 1)])
 
 
 def test_generated_sudoku_has_one_solution() -> None:

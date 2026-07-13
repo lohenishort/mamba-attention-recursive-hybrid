@@ -23,8 +23,8 @@ def test_model_e2e_forward() -> None:
         assert prob.shape == (2,)
 
 
-def test_init_answer() -> None:
-    """Tests the projection and initialization of the answer state."""
+def test_init_answer_pools_unaligned_input() -> None:
+    """Tests pooled initialization when input and answer lengths differ."""
     config: MambaHybridConfig = MambaHybridConfig(d_model=32, n_meta=8, l_ans=12)
     model: MambaAttentionHybrid = MambaAttentionHybrid(config)
     x_raw: torch.Tensor = torch.randn(3, 16, 32)  # [batch_size, seq_len, d_model]
@@ -44,6 +44,75 @@ def test_init_answer() -> None:
         )
         # Verify that positional embedding broke the symmetry (not equal to expected_proj alone)
         assert not torch.allclose(ans_init[:, i, :], expected_proj, atol=1e-5)
+
+
+def test_init_answer_preserves_aligned_input_positions() -> None:
+    """Tests that aligned answer slots retain their corresponding input states."""
+    config = MambaHybridConfig(d_model=32, n_meta=8, l_ans=4)
+    model = MambaAttentionHybrid(config)
+    x_raw = torch.arange(4 * 32, dtype=torch.float32).view(1, 4, 32)
+    with torch.no_grad():
+        model.ans_init_proj.weight.copy_(torch.eye(32))
+        model.ans_init_proj.bias.zero_()
+        model.y_pos_embed.zero_()
+
+    answer = model.init_answer(x_raw)
+
+    assert torch.equal(answer, x_raw)
+
+
+def test_masked_padding_does_not_change_model_output() -> None:
+    config = MambaHybridConfig(
+        d_model=32,
+        n_meta=4,
+        l_ans=2,
+        n_steps=1,
+        t_cycles=1,
+        M_min=1,
+        M_max=1,
+        vocab_size=11,
+    )
+    model = MambaAttentionHybrid(config).eval()
+    x_raw = torch.randn(1, 3, 32)
+    padded = torch.cat([x_raw, torch.randn(1, 2, 32)], dim=1)
+
+    base_logits, _ = model(x_raw)
+    padded_logits, _ = model(
+        padded, x_mask=torch.tensor([[True, True, True, False, False]])
+    )
+
+    assert torch.allclose(base_logits, padded_logits, atol=1e-5)
+
+
+def test_model_rejects_malformed_input_mask() -> None:
+    config = MambaHybridConfig(d_model=32, n_meta=4, l_ans=2, n_steps=1, t_cycles=1)
+    model = MambaAttentionHybrid(config)
+
+    with torch.no_grad():
+        try:
+            model(torch.randn(1, 3, 32), x_mask=torch.ones(1, 2, dtype=torch.bool))
+        except ValueError as error:
+            assert "x_mask" in str(error)
+        else:
+            raise AssertionError("malformed x_mask was accepted")
+
+
+def test_act_emits_one_decision_per_completed_cycle() -> None:
+    config = MambaHybridConfig(
+        d_model=32,
+        n_meta=4,
+        l_ans=2,
+        n_steps=2,
+        M_min=1,
+        M_max=3,
+        vocab_size=7,
+    )
+    model = MambaAttentionHybrid(config).train()
+
+    states, probabilities = model.forward_state_trajectory(torch.randn(1, 4, 32))
+
+    assert len(states) == config.M_max
+    assert len(probabilities) == config.M_max
 
 
 def test_model_determinism() -> None:

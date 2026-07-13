@@ -125,6 +125,8 @@ class MambaAttentionHybridBlock(nn.Module):
         x: torch.Tensor,
         causal: bool = False,
         task_names: List[str] | None = None,
+        valid_mask: torch.Tensor | None = None,
+        prefix_length: int | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for the hybrid block.
@@ -167,14 +169,33 @@ class MambaAttentionHybridBlock(nn.Module):
         k = k.view(B, L, 8, D // 8).transpose(1, 2)
         v = v.view(B, L, 8, D // 8).transpose(1, 2)
         # y_attn shape: [B, L, D]
-        y_attn: torch.Tensor = self.attn_branch(q, k, v, causal=causal)
+        y_attn: torch.Tensor = self.attn_branch(
+            q,
+            k,
+            v,
+            causal=causal,
+            valid_mask=valid_mask,
+            prefix_length=prefix_length,
+        )
 
         # SSM
         x_ssm: torch.Tensor
         g_ssm: torch.Tensor
         x_ssm, g_ssm = torch.split(p_ssm, [2 * D, 2 * D], dim=-1)
         # y_ssm shape: [B, L, D]
-        y_ssm: torch.Tensor = self.ssm_branch(x_ssm, g_ssm, h_in, h_out, delta)
+        y_ssm: torch.Tensor = self.ssm_branch(
+            x_ssm, g_ssm, h_in, h_out, delta, valid_mask=valid_mask
+        )
+        if not causal:
+            backward_ssm = self.ssm_branch(
+                x_ssm.flip(1),
+                g_ssm.flip(1),
+                h_in.flip(1),
+                h_out.flip(1),
+                delta.flip(1),
+                valid_mask=None if valid_mask is None else valid_mask.flip(1),
+            ).flip(1)
+            y_ssm = (y_ssm + backward_ssm) * 0.5
 
         # Fusion
         # Apply RMSNorm to both branches

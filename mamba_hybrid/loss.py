@@ -21,6 +21,7 @@ def compute_bce_joint_loss(
     correct_mask: torch.Tensor,
     alpha: float = 1.0,
     ignore_index: int = -100,
+    min_cycles: int = 1,
 ) -> torch.Tensor:
     """Computes the joint loss combining sparse task CE and BCE halting head loss.
 
@@ -52,10 +53,19 @@ def compute_bce_joint_loss(
     loss_bce = torch.tensor(0.0, device=y_final.device)
     n_steps = len(bce_probs)
     if n_steps > 0:
-        for prob in bce_probs:
+        if correct_mask.ndim == 1:
+            cycle_targets = correct_mask.unsqueeze(0).expand(n_steps, -1)
+        elif correct_mask.shape == (n_steps, y_final.shape[0]):
+            cycle_targets = correct_mask
+        else:
+            raise ValueError("correct_mask must have shape [B] or [cycles, B]")
+        for cycle_index, prob in enumerate(bce_probs):
             # prob: [batch_size], correct_mask: [batch_size]
+            target = cycle_targets[cycle_index]
+            if cycle_index + 1 < min_cycles:
+                target = torch.zeros_like(target)
             loss_bce = loss_bce + F.binary_cross_entropy(
-                prob.to(y_final.device), correct_mask.to(y_final.device)
+                prob.to(y_final.device), target.to(y_final.device)
             )
         loss_bce = loss_bce / n_steps
 
@@ -74,6 +84,7 @@ def compute_q_joint_loss(
     gamma: float = 1.0,
     states: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ignore_index: int = -100,
+    min_cycles: int = 1,
 ) -> torch.Tensor:
     """Computes the joint loss combining sparse task CE and Q-learning halting loss.
 
@@ -130,10 +141,13 @@ def compute_q_joint_loss(
 
             # q_preds[t]: [batch_size, 2]
             # Column 1 represents Q(s_t, halt), Column 0 represents Q(s_t, continue)
-            loss_q = (
-                loss_q
-                + (q_preds[t][:, 1].to(y_final.device) - q_halt_target).pow(2).mean()
-            )
+            if t + 1 >= min_cycles:
+                loss_q = (
+                    loss_q
+                    + (q_preds[t][:, 1].to(y_final.device) - q_halt_target)
+                    .pow(2)
+                    .mean()
+                )
             if t < n_steps - 1:
                 assert q_cont_target is not None
                 loss_q = (

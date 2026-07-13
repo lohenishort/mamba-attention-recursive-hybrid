@@ -43,6 +43,7 @@ class Mamba2SSDScan(nn.Module):
         h_in: torch.Tensor,  # [B, L, num_heads * d_state]
         h_out: torch.Tensor,  # [B, L, num_heads * d_state]
         delta: torch.Tensor,  # [B, L, num_heads]
+        valid_mask: torch.Tensor | None = None,  # [B, L]
     ) -> torch.Tensor:  # [B, L, d_model]
         """
         Computes the sequential Structured State Duality (SSD) scan.
@@ -58,6 +59,8 @@ class Mamba2SSDScan(nn.Module):
             Output tensor of shape [B, L, d_model]
         """
         B, L, _ = x.shape
+        if valid_mask is not None and valid_mask.shape != (B, L):
+            raise ValueError("valid_mask must have shape [batch_size, seq_len]")
 
         # Positive continuous-time step sizes: [B, L, num_heads]
         delta_pos: torch.Tensor = torch.nn.functional.softplus(delta)
@@ -70,7 +73,10 @@ class Mamba2SSDScan(nn.Module):
         d_head: int = self.ssm_dim // self.num_heads
         x_split: torch.Tensor = x.view(B, L, self.num_heads, d_head)
 
-        if self.use_cuda_kernels:
+        can_use_cuda_kernels = self.use_cuda_kernels and (
+            valid_mask is None or bool(valid_mask.all())
+        )
+        if can_use_cuda_kernels:
             if not HAS_CUDA_KERNELS:
                 raise RuntimeError(
                     "CUDA kernels are not available. Please install mamba-ssm or disable use_cuda_kernels."
@@ -111,7 +117,12 @@ class Mamba2SSDScan(nn.Module):
                 # Zero-order-hold SSD recurrence with A fixed to -1 per head.
                 decay: torch.Tensor = torch.exp(-dt_uns)
                 # Exact zero-order-hold discretization for A=-1.
-                h = decay * h + (1.0 - decay) * (bt * xt)
+                next_h = decay * h + (1.0 - decay) * (bt * xt)
+                if valid_mask is None:
+                    h = next_h
+                else:
+                    step_valid = valid_mask[:, t, None, None, None].to(torch.bool)
+                    h = torch.where(step_valid, next_h, h)
 
                 # Readout calculation
                 ct: torch.Tensor = h_out_split[:, t].unsqueeze(-1)
@@ -119,7 +130,10 @@ class Mamba2SSDScan(nn.Module):
 
                 # Reshape output and apply gate
                 out_reshaped: torch.Tensor = out_val.reshape(B, self.ssm_dim)
-                y_ssm[:, t] = out_reshaped * torch.sigmoid(gate[:, t])
+                step_output = out_reshaped * torch.sigmoid(gate[:, t])
+                if valid_mask is not None:
+                    step_output = step_output * valid_mask[:, t, None].to(x.dtype)
+                y_ssm[:, t] = step_output
 
         # Project back to d_model: [B, L, d_model]
         return cast(torch.Tensor, self.out_proj(y_ssm))

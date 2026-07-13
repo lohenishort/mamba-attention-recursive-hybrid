@@ -116,3 +116,14 @@ def test_moe_layer_and_block() -> None:
     expert_seq = block.moe.experts["MAZE"]
     assert isinstance(expert_seq, nn.Sequential)
     assert expert_seq[0].weight.grad is not None
+
+
+def test_non_causal_hybrid_block_is_sequence_reversal_equivariant() -> None:
+    config = MambaHybridConfig(d_model=16, n_meta=2, l_ans=2, n_steps=1)
+    block = MambaAttentionHybridBlock(config).eval()
+    inputs = torch.randn(2, 7, 16)
+
+    forwards = block(inputs, causal=False)
+    backwards = block(inputs.flip(1), causal=False).flip(1)
+
+    assert torch.allclose(forwards, backwards, atol=1e-5)
