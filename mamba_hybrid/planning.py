@@ -96,30 +96,31 @@ class PlanningLoop(nn.Module):
         # z: [batch_size, n_meta, d_model]
         # y: [batch_size, l_ans, d_model]
         # Run one complete cycle (n latent updates + 1 answer update).
+        valid_mask = None
+        if x_mask is not None:
+            prefix_mask = torch.ones(
+                x_raw.shape[0],
+                z.shape[1] + y.shape[1],
+                dtype=torch.bool,
+                device=x_raw.device,
+            )
+            valid_mask = torch.cat(
+                [prefix_mask, x_mask.to(device=x_raw.device, dtype=torch.bool)], dim=1
+            )
         for step in range(1, self.n_steps + 1):
             X_concat = torch.cat([z, y, x_raw], dim=1)
-            valid_mask = None
-            if x_mask is not None:
-                prefix_mask = torch.ones(
-                    x_raw.shape[0],
-                    z.shape[1] + y.shape[1],
-                    dtype=torch.bool,
-                    device=x_raw.device,
-                )
-                valid_mask = torch.cat([prefix_mask, x_mask.to(torch.bool)], dim=1)
             z = self.planning_block(
                 X_concat,
                 causal=False,
                 task_names=task_names,
                 valid_mask=valid_mask,
-            )[:, : self.n_meta, :]
+                output_prefix_length=self.n_meta,
+            )
             global_step = cycle_index * self.n_steps + step
-            if (
-                self.training
-                and global_step <= self.config.max_noise_step
-                and torch.rand((), device=z.device).item() < 0.15
-            ):
+            if self.training and global_step <= self.config.max_noise_step:
+                apply_noise = torch.rand((), device=z.device) < 0.15
                 eta = torch.rand((), device=z.device) * 0.5
                 noise_std = self.config.sigma_base * torch.sqrt(eta)
-                z = z + torch.randn_like(z) * noise_std
+                noise = torch.randn_like(z) * noise_std
+                z = torch.where(apply_noise, z + noise, z)
         return z, self.update_answer(z, y, task_names)

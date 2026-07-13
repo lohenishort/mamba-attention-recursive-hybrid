@@ -1,4 +1,5 @@
 import pytest
+import torch
 from pathlib import Path
 
 from mamba_hybrid.config import MambaHybridConfig
@@ -67,3 +68,45 @@ def test_gsm8k_dataset_and_model_use_dynamic_masked_batches(tmp_path: Path) -> N
     assert logits.shape == (*targets.shape, 259)
     assert len(probabilities) == 1
     assert question_mask.sum(dim=1).tolist() == [5, 6]
+
+
+def test_gsm8k_forward_decodes_only_final_cycle_and_matches_cycle_logits() -> None:
+    config = MambaHybridConfig(
+        d_model=8,
+        n_meta=2,
+        l_ans=1,
+        n_steps=1,
+        M_min=1,
+        M_max=3,
+        vocab_size=259,
+        halt_threshold=1.0,
+    )
+    model = GSM8KReasoningModel(
+        config, max_question_bytes=8, max_answer_length=4
+    ).eval()
+    questions = torch.tensor([[ord("1"), EOS]])
+    question_mask = torch.ones_like(questions, dtype=torch.bool)
+    decoder_inputs = torch.tensor([[BOS, ord("2")]])
+    printer_calls = 0
+
+    def count_printer_calls(
+        _module: torch.nn.Module,
+        _inputs: tuple[torch.Tensor, ...],
+        _output: torch.Tensor,
+    ) -> None:
+        nonlocal printer_calls
+        printer_calls += 1
+
+    hook = model.printer.register_forward_hook(count_printer_calls)
+    try:
+        final_logits, _ = model(questions, question_mask, decoder_inputs)
+        assert printer_calls == 1
+
+        cycle_logits, _ = model.forward_cycle_logits(
+            questions, question_mask, decoder_inputs
+        )
+        assert printer_calls == 1 + config.M_max
+    finally:
+        hook.remove()
+
+    assert torch.equal(final_logits, cycle_logits[-1])

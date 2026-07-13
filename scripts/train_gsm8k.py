@@ -142,11 +142,18 @@ class GSM8KReasoningModel(nn.Module):
             x_mask=question_mask,
         )
         cycle_logits: list[torch.Tensor] = []
-        for state in states:
-            prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
-                x_raw, state, question_mask
-            )
-            cycle_logits.append(self.printer(prefix, decoder_input_ids, prefix_mask))
+        with torch.no_grad():
+            for state in states[:-1]:
+                prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
+                    x_raw, state, question_mask
+                )
+                cycle_logits.append(
+                    self.printer(prefix, decoder_input_ids, prefix_mask)
+                )
+        prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
+            x_raw, states[-1], question_mask
+        )
+        cycle_logits.append(self.printer(prefix, decoder_input_ids, prefix_mask))
         return cycle_logits, probabilities
 
     def forward(
@@ -155,10 +162,16 @@ class GSM8KReasoningModel(nn.Module):
         question_mask: torch.Tensor,
         decoder_input_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        cycle_logits, probabilities = self.forward_cycle_logits(
-            question_ids, question_mask, decoder_input_ids
+        x_raw = self.encode_questions(question_ids, question_mask)
+        states, probabilities = self.reasoning_encoder.forward_state_trajectory(
+            x_raw,
+            task_names=["GSM8K"] * x_raw.shape[0],
+            x_mask=question_mask,
         )
-        return cycle_logits[-1], probabilities
+        prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
+            x_raw, states[-1], question_mask
+        )
+        return self.printer(prefix, decoder_input_ids, prefix_mask), probabilities
 
     @torch.no_grad()
     def generate(

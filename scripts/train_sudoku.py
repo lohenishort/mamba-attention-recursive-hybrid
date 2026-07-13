@@ -134,22 +134,24 @@ class SudokuReasoningModel(nn.Module):
         prefix_mask: torch.Tensor,
         input_ids: torch.Tensor,
     ) -> torch.Tensor:
-        decoder_input = torch.full(
-            (input_ids.shape[0], 1),
+        batch_size = input_ids.shape[0]
+        cache = self.printer.prefill(prefix, prefix_mask, capacity=81)
+        current = torch.full(
+            (batch_size,),
             self.bos_token,
             dtype=torch.long,
             device=input_ids.device,
         )
         outputs: list[torch.Tensor] = []
         for position in range(81):
-            logits = self.printer(prefix, decoder_input, prefix_mask)[:, -1]
+            logits, cache = self.printer.decode_step(current, cache, position=position)
             clue = input_ids[:, position]
             forced = torch.full_like(logits, torch.finfo(logits.dtype).min)
             forced.scatter_(-1, clue.unsqueeze(-1), 0.0)
             logits = torch.where(clue.ne(0).unsqueeze(-1), forced, logits)
             outputs.append(logits)
             next_token = logits.argmax(dim=-1)
-            decoder_input = torch.cat([decoder_input, next_token.unsqueeze(1)], dim=1)
+            current = next_token
         return torch.stack(outputs, dim=1)
 
     def forward(
@@ -182,15 +184,24 @@ class SudokuReasoningModel(nn.Module):
             x_raw, task_names=["SUDOKU"] * x_raw.shape[0]
         )
         cycle_logits: list[torch.Tensor] = []
-        for state in states:
-            prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
-                x_raw, state
-            )
-            cycle_logits.append(
-                self._apply_clues(
-                    self.printer(prefix, decoder_input_ids, prefix_mask), input_ids
+        with torch.no_grad():
+            for state in states[:-1]:
+                prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
+                    x_raw, state
                 )
+                cycle_logits.append(
+                    self._apply_clues(
+                        self.printer(prefix, decoder_input_ids, prefix_mask), input_ids
+                    )
+                )
+        prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
+            x_raw, states[-1]
+        )
+        cycle_logits.append(
+            self._apply_clues(
+                self.printer(prefix, decoder_input_ids, prefix_mask), input_ids
             )
+        )
         return cycle_logits, probabilities
 
 
