@@ -10,7 +10,7 @@ def generate_maze(size: int) -> Tuple[List[List[int]], List[Tuple[int, int]]]:
         stack = [(0, 0)]
         grid[0][0] = 0
         visited = {(0, 0)}
-        
+
         while stack:
             cx, cy = stack[-1]
             neighbors = []
@@ -24,7 +24,7 @@ def generate_maze(size: int) -> Tuple[List[List[int]], List[Tuple[int, int]]]:
                             path_neighbors += 1
                     if path_neighbors <= 2:
                         neighbors.append((nx, ny))
-            
+
             if neighbors:
                 nx, ny = random.choice(neighbors)
                 grid[nx][ny] = 0
@@ -32,10 +32,10 @@ def generate_maze(size: int) -> Tuple[List[List[int]], List[Tuple[int, int]]]:
                 stack.append((nx, ny))
             else:
                 stack.pop()
-                
+
         grid[0][0] = 0
         grid[size - 1][size - 1] = 0
-        
+
         queue = [[(0, 0)]]
         bfs_visited = {(0, 0)}
         path = []
@@ -47,10 +47,15 @@ def generate_maze(size: int) -> Tuple[List[List[int]], List[Tuple[int, int]]]:
                 break
             for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nx, ny = cx + dx, cy + dy
-                if 0 <= nx < size and 0 <= ny < size and grid[nx][ny] == 0 and (nx, ny) not in bfs_visited:
+                if (
+                    0 <= nx < size
+                    and 0 <= ny < size
+                    and grid[nx][ny] == 0
+                    and (nx, ny) not in bfs_visited
+                ):
                     bfs_visited.add((nx, ny))
                     queue.append(curr_path + [(nx, ny)])
-                    
+
         if path:
             return grid, path
 

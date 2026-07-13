@@ -7,13 +7,23 @@ from typing import List, Dict, Any, Tuple
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.model import MambaAttentionHybrid
 from mamba_hybrid.loss import compute_bce_joint_loss
+from scripts.utils import deterministic_split_indices, exact_match, seed_everything
 
 
 # --- 1. Custom Dataset for Maze Pathfinding ---
 class MazeDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
-    def __init__(self, data_path: str, size: int = 30, max_path_len: int = 64) -> None:
+    def __init__(
+        self, data_path: str, size: int | None = None, max_path_len: int = 64
+    ) -> None:
         self.samples: List[Dict[str, Any]] = torch.load(data_path)
-        self.size = size
+        if not self.samples:
+            raise ValueError(f"Maze dataset is empty: {data_path}")
+        inferred_size = len(self.samples[0]["grid"])
+        self.size = inferred_size if size is None else size
+        if self.size != inferred_size:
+            raise ValueError(
+                f"Configured maze size {self.size} does not match dataset size {inferred_size}"
+            )
         self.max_path_len = max_path_len
 
     def __len__(self) -> int:
@@ -23,6 +33,7 @@ class MazeDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
         sample = self.samples[idx]
         grid = torch.tensor(sample["grid"], dtype=torch.float32)  # [size, size]
         path = sample["path"]
+        validate_maze_path(sample["grid"], path)
 
         # Flatten grid: [L_raw] = [900]
         grid_flat = grid.flatten()
@@ -35,10 +46,27 @@ class MazeDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
             # Pad with a dummy padding token (e.g. size * size)
             pad_val = self.size * self.size
             path_tokens += [pad_val] * (self.max_path_len - len(path_tokens))
-        else:
-            path_tokens = path_tokens[: self.max_path_len]
+        elif len(path_tokens) > self.max_path_len:
+            raise ValueError(
+                f"Path length {len(path_tokens)} exceeds l_ans={self.max_path_len}; "
+                "increase l_ans instead of silently truncating the path"
+            )
 
         return grid_flat, torch.tensor(path_tokens, dtype=torch.long)
+
+
+def validate_maze_path(grid: List[List[int]], path: List[Tuple[int, int]]) -> None:
+    size = len(grid)
+    if not path or path[0] != (0, 0) or path[-1] != (size - 1, size - 1):
+        raise ValueError("Maze path must connect the top-left and bottom-right cells")
+    for (r, c), (next_r, next_c) in zip(path, path[1:]):
+        if not (0 <= r < size and 0 <= c < size) or grid[r][c] != 0:
+            raise ValueError(f"Maze path visits an invalid or blocked cell: {(r, c)}")
+        if abs(r - next_r) + abs(c - next_c) != 1:
+            raise ValueError("Maze path contains non-adjacent steps")
+    end_r, end_c = path[-1]
+    if grid[end_r][end_c] != 0:
+        raise ValueError("Maze path ends on a blocked cell")
 
 
 # --- 2. Maze reasoning model wrapper ---
@@ -56,8 +84,9 @@ class MazeReasoningModel(nn.Module):
         self.row_embed = nn.Parameter(torch.randn(1, grid_size, config.d_model // 2))
         self.col_embed = nn.Parameter(torch.randn(1, grid_size, config.d_model // 2))
 
+        if config.vocab_size != self.vocab_size:
+            raise ValueError("config.vocab_size must match the maze vocabulary")
         self.reasoning_encoder = MambaAttentionHybrid(config)
-        self.token_generator = nn.Linear(config.d_model, self.vocab_size)
 
     def forward(
         self, grid_flat: torch.Tensor
@@ -83,12 +112,8 @@ class MazeReasoningModel(nn.Module):
 
         X_raw = x_state + pos_2d  # [B, L_raw, D]
 
-        # Run Mamba-Attention hybrid reasoning loops
-        y_final, bce_probs = self.reasoning_encoder(X_raw)  # [B, l_ans, D]
-
-        # Project representation to path token space
-        logits = self.token_generator(y_final)  # [B, l_ans, vocab_size]
-        return logits, bce_probs
+        output: Tuple[torch.Tensor, List[torch.Tensor]] = self.reasoning_encoder(X_raw)
+        return output
 
 
 # --- 3. Main Training Driver ---
@@ -108,22 +133,33 @@ def main() -> None:
     print(f"Using device: {device}")
 
     # Configuration
-    l_ans = 16
+    raw_samples: List[Dict[str, Any]] = torch.load(data_path)
+    grid_size = len(raw_samples[0]["grid"])
+    l_ans = max(len(sample["path"]) for sample in raw_samples)
     config = MambaHybridConfig(
-        d_model=64, n_meta=16, l_ans=l_ans, n_steps=2, t_cycles=2
+        d_model=64,
+        n_meta=16,
+        l_ans=l_ans,
+        n_steps=2,
+        t_cycles=2,
+        vocab_size=grid_size * grid_size + 1,
     )
 
     # Initialize dataset & dataloader
-    dataset = MazeDataset(data_path, size=10, max_path_len=l_ans)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+    dataset = MazeDataset(data_path, size=grid_size, max_path_len=l_ans)
+    seed = 42
+    generator = seed_everything(seed)
+    train_indices, validation_indices = deterministic_split_indices(len(dataset), seed)
+    train_set = torch.utils.data.Subset(dataset, train_indices)
+    val_set = torch.utils.data.Subset(dataset, validation_indices)
 
-    train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
+    train_loader = DataLoader(
+        train_set, batch_size=32, shuffle=True, generator=generator
+    )
     val_loader = DataLoader(val_set, batch_size=32, shuffle=False)
 
     # Initialize model & optimizer
-    model = MazeReasoningModel(config, grid_size=10).to(device)
+    model = MazeReasoningModel(config, grid_size=grid_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
 
     epochs = 5
@@ -145,12 +181,17 @@ def main() -> None:
             # Calculate accuracy dynamically to get correct_mask for halting supervision
             preds = logits.argmax(dim=-1)  # [B, l_ans]
             # Check if all tokens match target sequence
-            is_correct = (preds == target_ids).all(dim=-1)  # [B]
+            is_correct = exact_match(preds, target_ids, grid_size * grid_size)  # [B]
             correct_mask = is_correct.float()
 
             # Compute joint loss
             loss = compute_bce_joint_loss(
-                logits, target_ids, bce_probs, correct_mask, alpha=1.0, ignore_index=900
+                logits,
+                target_ids,
+                bce_probs,
+                correct_mask,
+                alpha=1.0,
+                ignore_index=grid_size * grid_size,
             )
 
             loss.backward()  # type: ignore[no-untyped-call]
@@ -158,7 +199,7 @@ def main() -> None:
             optimizer.step()
 
             total_loss += loss.item() * grid_flat.size(0)
-            correct_count += is_correct.sum().item()
+            correct_count += int(is_correct.sum().item())
             total_samples += grid_flat.size(0)
 
         train_loss = total_loss / total_samples
@@ -174,13 +215,18 @@ def main() -> None:
                 grid_flat, target_ids = grid_flat.to(device), target_ids.to(device)
                 logits, bce_probs = model(grid_flat)
                 preds = logits.argmax(dim=-1)
-                is_correct = (preds == target_ids).all(dim=-1)
+                is_correct = exact_match(preds, target_ids, grid_size * grid_size)
                 loss = compute_bce_joint_loss(
-                    logits, target_ids, bce_probs, is_correct.float(), alpha=1.0, ignore_index=900
+                    logits,
+                    target_ids,
+                    bce_probs,
+                    is_correct.float(),
+                    alpha=1.0,
+                    ignore_index=grid_size * grid_size,
                 )
 
                 val_loss += loss.item() * grid_flat.size(0)
-                val_correct += is_correct.sum().item()
+                val_correct += int(is_correct.sum().item())
                 val_samples += grid_flat.size(0)
 
         val_loss /= val_samples
@@ -192,7 +238,19 @@ def main() -> None:
 
     # Save the model
     os.makedirs("data", exist_ok=True)
-    torch.save(model.state_dict(), "data/maze_model.pt")
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "config": vars(config),
+            "grid_size": grid_size,
+            "max_path_len": l_ans,
+            "padding_index": grid_size * grid_size,
+            "dataset": data_path,
+            "seed": seed,
+            "validation_indices": validation_indices,
+        },
+        "data/maze_model.pt",
+    )
     print("Successfully saved trained model state dict to data/maze_model.pt")
 
 

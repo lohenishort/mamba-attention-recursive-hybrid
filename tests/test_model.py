@@ -6,14 +6,16 @@ from mamba_hybrid.model import MambaAttentionHybrid
 
 def test_model_e2e_forward() -> None:
     """Tests the end-to-end forward pass shapes of MambaAttentionHybrid."""
-    config: MambaHybridConfig = MambaHybridConfig(d_model=64, n_meta=16, l_ans=8)
+    config: MambaHybridConfig = MambaHybridConfig(
+        d_model=64, n_meta=16, l_ans=8, vocab_size=73
+    )
     model: MambaAttentionHybrid = MambaAttentionHybrid(config)
     x_raw: torch.Tensor = torch.randn(2, 32, 64)  # [batch_size, seq_len, d_model]
     y_final: torch.Tensor
     bce_probs: list[torch.Tensor]
     y_final, bce_probs = model(x_raw)
     # y_final: [batch_size, l_ans, d_model]
-    assert y_final.shape == (2, 8, 64)
+    assert y_final.shape == (2, 8, 73)
     assert len(bce_probs) == config.n_steps
     prob: torch.Tensor
     for prob in bce_probs:
@@ -37,7 +39,9 @@ def test_init_answer() -> None:
     # Check that each position along the sequence dim matches expected_proj + y_pos_embed
     i: int
     for i in range(12):
-        assert torch.allclose(ans_init[:, i, :], expected_proj + model.y_pos_embed[:, i, :], atol=1e-5)
+        assert torch.allclose(
+            ans_init[:, i, :], expected_proj + model.y_pos_embed[:, i, :], atol=1e-5
+        )
         # Verify that positional embedding broke the symmetry (not equal to expected_proj alone)
         assert not torch.allclose(ans_init[:, i, :], expected_proj, atol=1e-5)
 
@@ -45,7 +49,7 @@ def test_init_answer() -> None:
 def test_model_determinism() -> None:
     """Tests that the model is deterministic in eval mode and is stochastic/adds noise in train mode."""
     config: MambaHybridConfig = MambaHybridConfig(
-        d_model=32, n_meta=8, l_ans=4, n_steps=3, t_cycles=2
+        d_model=32, n_meta=8, l_ans=4, n_steps=3, t_cycles=2, M_max=3
     )
     model: MambaAttentionHybrid = MambaAttentionHybrid(config)
     x_raw: torch.Tensor = torch.randn(2, 10, 32)  # [batch_size, seq_len, d_model]
@@ -91,9 +95,9 @@ def test_model_determinism() -> None:
 
 def test_model_gradients() -> None:
     """Tests gradient flow through the MambaAttentionHybrid model during the supervision cycle."""
-    # Case 1: t_cycles > 1 (e.g. t_cycles=3), gradients should NOT flow to M_meta / ans_init_proj
+    # Full-recursion BPTT must reach learned initialization through every cycle.
     config_warmup: MambaHybridConfig = MambaHybridConfig(
-        d_model=32, n_meta=8, l_ans=4, n_steps=3, t_cycles=3
+        d_model=32, n_meta=8, l_ans=4, n_steps=3, t_cycles=3, M_max=3
     )
     model_warmup: MambaAttentionHybrid = MambaAttentionHybrid(config_warmup)
     model_warmup.train()
@@ -111,11 +115,10 @@ def test_model_gradients() -> None:
     )
     loss_warmup.backward()  # type: ignore[no-untyped-call]
 
-    # With t_cycles > 1, warmup cycles run in no_grad, so gradients do NOT flow back to initialization parameters
-    assert model_warmup.M_meta.grad is None
-    assert model_warmup.y_pos_embed.grad is None
-    assert model_warmup.ans_init_proj.weight.grad is None
-    assert model_warmup.ans_init_proj.bias.grad is None
+    assert model_warmup.M_meta.grad is not None
+    assert model_warmup.y_pos_embed.grad is not None
+    assert model_warmup.ans_init_proj.weight.grad is not None
+    assert model_warmup.ans_init_proj.bias.grad is not None
 
     # Check gradient flow to planning block parameters
     assert model_warmup.planning_loop.planning_block.beta_1.grad is not None
@@ -124,12 +127,13 @@ def test_model_gradients() -> None:
     # Check gradient flow to ACT halting head parameters
     name: str
     param: torch.Tensor
-    for name, param in model_warmup.q_head.named_parameters():
+    for name, param in model_warmup.q_head.bce_mlp.named_parameters():
         assert param.grad is not None, f"Parameter {name} did not receive gradients."
+    assert all(param.grad is None for param in model_warmup.q_head.q_mlp.parameters())
 
     # Case 2: t_cycles = 1, gradients MUST flow to M_meta / ans_init_proj
     config_no_warmup: MambaHybridConfig = MambaHybridConfig(
-        d_model=32, n_meta=8, l_ans=4, n_steps=3, t_cycles=1
+        d_model=32, n_meta=8, l_ans=4, n_steps=3, t_cycles=1, M_max=3
     )
     model_no_warmup: MambaAttentionHybrid = MambaAttentionHybrid(config_no_warmup)
     model_no_warmup.train()
@@ -158,5 +162,27 @@ def test_model_gradients() -> None:
     assert model_no_warmup.planning_loop.planning_block.beta_2.grad is not None
 
     # Check gradient flow to ACT halting head parameters
-    for name, param in model_no_warmup.q_head.named_parameters():
+    for name, param in model_no_warmup.q_head.bce_mlp.named_parameters():
         assert param.grad is not None, f"Parameter {name} did not receive gradients."
+    assert all(
+        param.grad is None for param in model_no_warmup.q_head.q_mlp.parameters()
+    )
+
+
+def test_act_halts_at_minimum_and_validates_tasks() -> None:
+    config = MambaHybridConfig(
+        d_model=32, n_meta=4, l_ans=2, n_steps=4, M_min=2, M_max=4
+    )
+    model = MambaAttentionHybrid(config).eval()
+    x_raw = torch.randn(1, 3, 32)
+    with patch.object(model.q_head, "forward", return_value=torch.ones(1)):
+        logits, probabilities = model(x_raw)
+    assert logits.shape == (1, 2, config.vocab_size)
+    assert len(probabilities) == config.M_min
+    with torch.no_grad():
+        try:
+            model(x_raw, task_names=["UNKNOWN"])
+        except ValueError as error:
+            assert "unknown task_names" in str(error)
+        else:
+            raise AssertionError("invalid task name was accepted")

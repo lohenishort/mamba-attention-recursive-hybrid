@@ -2,8 +2,8 @@ import os
 import torch
 from typing import List
 
-from mamba_hybrid.config import MambaHybridConfig
 from scripts.train_sudoku import SudokuReasoningModel, SudokuDataset
+from scripts.utils import config_from_dict, load_validation_indices
 
 
 def print_sudoku_board(board: List[int]) -> None:
@@ -37,14 +37,7 @@ def main() -> None:
 
     # Load checkpoint and config
     checkpoint = torch.load(model_path, map_location=device)
-    config_dict = checkpoint["config"]
-    config = MambaHybridConfig(
-        d_model=config_dict.get("d_model", 128),
-        n_meta=config_dict.get("n_meta", 32),
-        l_ans=config_dict.get("l_ans", 81),
-        n_steps=config_dict.get("n_steps", 4),
-        t_cycles=config_dict.get("t_cycles", 3),
-    )
+    config = config_from_dict(checkpoint["config"])
 
     # Initialize model
     model = SudokuReasoningModel(config, vocab_size=10).to(device)
@@ -53,16 +46,16 @@ def main() -> None:
 
     # Load dataset
     import json
+
     samples = []
     with open(data_path, "r") as f:
         for line in f:
             samples.append(json.loads(line))
-            if len(samples) >= 10:
-                break
+    validation_indices = load_validation_indices(checkpoint)
     dataset = SudokuDataset(samples, augment=False)
 
     # Run evaluation on the first sample
-    input_ids, target_ids = dataset[0]
+    input_ids, target_ids = dataset[validation_indices[0]]
 
     with torch.no_grad():
         inp_batch = input_ids.unsqueeze(0).to(device)
@@ -81,6 +74,20 @@ def main() -> None:
     # Check accuracy
     correct_cells = sum(1 for p, t in zip(preds, target_ids.tolist()) if p == t)
     print(f"\nCell Accuracy: {correct_cells}/81 ({correct_cells / 81 * 100:.1f}%)")
+    total_cells = 0
+    exact_boards = 0
+    with torch.no_grad():
+        for index in validation_indices:
+            inputs, targets = dataset[index]
+            predictions = (
+                model(inputs.unsqueeze(0).to(device))[0].argmax(-1).squeeze(0).cpu()
+            )
+            total_cells += int(predictions.eq(targets).sum().item())
+            exact_boards += int(predictions.eq(targets).all().item())
+    print(f"Held-out cell accuracy: {total_cells / (81 * len(validation_indices)):.4f}")
+    print(
+        f"Held-out exact-board accuracy: {exact_boards / len(validation_indices):.4f}"
+    )
 
 
 if __name__ == "__main__":

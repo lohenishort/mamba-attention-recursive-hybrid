@@ -1,184 +1,139 @@
-from typing import List
+from typing import List, cast
+
 import torch
 import torch.nn as nn
+
+from mamba_hybrid.answer_update import AnswerUpdateBlock
 from mamba_hybrid.config import MambaHybridConfig
-from mamba_hybrid.planning import PlanningLoop
 from mamba_hybrid.halting import ACTHaltingModule
+from mamba_hybrid.planning import PlanningLoop
+
+
+SUPPORTED_TASKS = frozenset({"MAZE", "SUDOKU", "DIJKSTRA", "GSM8K"})
 
 
 class MambaAttentionHybrid(nn.Module):
-    """
-    Core Mamba-Attention Recursive Reasoning Hybrid model that coordinates
-    warmup planning loops (T-1 cycles with gradients disabled) and the final
-    supervision cycle (T cycle with gradients enabled) along with the ACT halting module.
-    """
+    """Recursive latent planner with explicit answer decoding and ACT heads."""
 
     def __init__(self, config: MambaHybridConfig) -> None:
         super().__init__()
-        self.config: MambaHybridConfig = config
-        self.d_model: int = config.d_model
-        self.n_meta: int = config.n_meta
-        self.l_ans: int = config.l_ans
-        self.n_steps: int = config.n_steps
-        self.t_cycles: int = config.t_cycles
-        self.M_min: int = config.M_min
-        self.M_max: int = config.M_max
+        self.config = config
+        self.d_model = config.d_model
+        self.n_meta = config.n_meta
+        self.l_ans = config.l_ans
+        self.n_steps = config.n_steps
+        self.t_cycles = config.t_cycles
+        self.M_min = config.M_min
+        self.M_max = config.M_max
+        self.M_meta = nn.Parameter(torch.randn(1, self.n_meta, self.d_model))
+        self.y_pos_embed = nn.Parameter(torch.randn(1, self.l_ans, self.d_model))
+        self.ans_init_proj = nn.Linear(self.d_model, self.d_model)
+        self.vocab_decoder = nn.Linear(self.d_model, config.vocab_size, bias=False)
+        self.planning_loop = PlanningLoop(config)
+        self.q_head = ACTHaltingModule(config)
 
-        # Learned initial planning state meta-tokens
-        self.M_meta: nn.Parameter = nn.Parameter(
-            torch.randn(1, self.n_meta, self.d_model)
-        )
+    def _validate_tasks(self, task_names: List[str] | None, batch_size: int) -> None:
+        if task_names is None:
+            return
+        if len(task_names) != batch_size:
+            raise ValueError("task_names length must match batch size")
+        unknown = set(task_names) - SUPPORTED_TASKS
+        if unknown:
+            raise ValueError(f"unknown task_names: {sorted(unknown)}")
 
-        # Positional embedding for the answer sequence y to break symmetry
-        self.y_pos_embed: nn.Parameter = nn.Parameter(
-            torch.randn(1, self.l_ans, self.d_model)
-        )
+    def init_answer(self, x_raw: torch.Tensor) -> torch.Tensor:
+        """Initialize latent answer states from pooled input. [B, L_ans, D]."""
+        pooled = x_raw.mean(dim=1)  # [batch_size, d_model]
+        answer = self.ans_init_proj(pooled).unsqueeze(1).expand(-1, self.l_ans, -1)
+        return cast(torch.Tensor, answer + self.y_pos_embed)
 
-        # Projection layer to initialize answer representation from pooled input context
-        self.ans_init_proj: nn.Linear = nn.Linear(self.d_model, self.d_model)
+    def decode_answer(self, answer_states: torch.Tensor) -> torch.Tensor:
+        """Project latent answer states to vocabulary logits. [B, L_ans, V]."""
+        return cast(torch.Tensor, self.vocab_decoder(answer_states))
 
-        self.planning_loop: PlanningLoop = PlanningLoop(config)
-        self.q_head: ACTHaltingModule = ACTHaltingModule(config)
+    def _update_answer(
+        self, z: torch.Tensor, y: torch.Tensor, task_names: List[str] | None
+    ) -> torch.Tensor:
+        blocks = self.planning_loop.answer_update_blocks
+        if self.config.use_moe and blocks is not None:
+            names = task_names if task_names is not None else ["MAZE"] * y.shape[0]
+            outputs: list[torch.Tensor] = []
+            for index, task in enumerate(names):
+                task_block = blocks[task]
+                assert isinstance(task_block, AnswerUpdateBlock)
+                outputs.append(task_block(z[index : index + 1], y[index : index + 1]))
+            return torch.cat(outputs, dim=0)
+        answer_block = self.planning_loop.answer_update_block
+        if answer_block is None:
+            return y
+        return cast(torch.Tensor, answer_block(z, y))
 
-    def init_answer(self, X_raw: torch.Tensor) -> torch.Tensor:
-        """
-        Projects average pooled raw input context to initialize the answer state y.
-
-        Args:
-            X_raw: Raw input context of shape [B, L_raw, D]
-
-        Returns:
-            ans_init: Initialized answer state of shape [B, L_ans, D]
-        """
-        # X_raw: [batch_size, seq_len, d_model]
-        pooled: torch.Tensor = X_raw.mean(dim=1)  # [batch_size, d_model]
-        ans_init: torch.Tensor = (
-            self.ans_init_proj(pooled).unsqueeze(1).expand(-1, self.l_ans, -1)
-        )  # [batch_size, l_ans, d_model]
-        ans_init = ans_init + self.y_pos_embed
-        return ans_init
+    def _initialize(
+        self, x_raw: torch.Tensor, task_names: List[str] | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = x_raw.shape[0]
+        self._validate_tasks(task_names, batch_size)
+        z = self.M_meta.expand(batch_size, -1, -1)
+        y = self.init_answer(x_raw)
+        for _ in range(1, self.t_cycles):
+            z, y = self.planning_loop(x_raw, z, y, warmup=True, task_names=task_names)
+        return z, y
 
     def forward(
-        self, X_raw: torch.Tensor, task_names: List[str] | None = None
+        self, x_raw: torch.Tensor, task_names: List[str] | None = None
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """
-        Forward pass coordinating warmup loops and the final supervision loop.
+        """Return vocabulary logits and per-step BCE halting probabilities."""
+        z, y = self._initialize(x_raw, task_names)
+        batch_size = x_raw.shape[0]
+        active = torch.ones(batch_size, dtype=torch.bool, device=x_raw.device)
+        probabilities: list[torch.Tensor] = []
+        max_steps = self.n_steps if self.training else self.M_max
 
-        Args:
-            X_raw: Raw input context of shape [B, L_raw, D]
-            task_names: Optional task prefix names for MoE routing.
-
-        Returns:
-            y_final: Final updated answer prediction state of shape [B, L_ans, D]
-            bce_probs: List of halting probabilities from the ACT head for each step in cycle T
-        """
-        # X_raw: [batch_size, seq_len, d_model]
-        B, L_raw, D = X_raw.shape
-        z: torch.Tensor = self.M_meta.expand(B, -1, -1)  # [batch_size, n_meta, d_model]
-        y: torch.Tensor = self.init_answer(X_raw)  # [batch_size, l_ans, d_model]
-
-        # Warmup phase (T-1 cycles, no grad)
-        for c in range(1, self.t_cycles):
-            z, y = self.planning_loop(X_raw, z, y, warmup=True, task_names=task_names)
-
-        # Supervision cycle (T cycle, grad enabled)
-
-        bce_probs: list[torch.Tensor] = []
-        for i in range(1, self.n_steps + 1):
-            # Execute one latent step within cycle T with gradients
-            X_concat: torch.Tensor = torch.cat(
-                [z, y, X_raw], dim=1
-            )  # [batch_size, n_meta + l_ans + seq_len, d_model]
-            z = self.planning_loop.planning_block(
-                X_concat, causal=False, task_names=task_names
-            )[:, : self.n_meta, :]  # [batch_size, n_meta, d_model]
-
-            # Regularization training noise
+        for step in range(1, max_steps + 1):
+            previous_z, previous_y = z, y
+            x_concat = torch.cat([z, y, x_raw], dim=1)
+            next_z = self.planning_loop.planning_block(
+                x_concat, causal=False, task_names=task_names
+            )[:, : self.n_meta, :]
             if self.training and torch.rand(1).item() < 0.15:
-                # Add training-only regularization noise
-                noise: torch.Tensor = torch.randn_like(z) * torch.rand(1).item() * 0.025
-                z = z + noise
+                next_z = (
+                    next_z + torch.randn_like(next_z) * torch.rand(1).item() * 0.025
+                )
+            next_y = self._update_answer(next_z, y, task_names)
+            if self.training:
+                z, y = next_z, next_y
+            else:
+                mask = active[:, None, None]
+                z = torch.where(mask, next_z, previous_z)
+                y = torch.where(mask, next_y, previous_y)
+            probability = self.q_head(z, y)
+            probabilities.append(probability)
+            if not self.training and step >= self.M_min:
+                active = active & (probability < self.config.halt_threshold)
+                if not bool(active.any()):
+                    break
 
-            bce_prob: torch.Tensor = self.q_head(z, y)  # [batch_size]
-            bce_probs.append(bce_prob)
-
-        if self.planning_loop.config.use_moe and self.planning_loop.answer_update_blocks is not None:
-            y_list = []
-            for i in range(y.shape[0]):
-                task = task_names[i] if task_names is not None else "MAZE"
-                if task not in self.planning_loop.answer_update_blocks:
-                    task = "MAZE"
-                from mamba_hybrid.answer_update import AnswerUpdateBlock
-                block = self.planning_loop.answer_update_blocks[task]
-                assert isinstance(block, AnswerUpdateBlock)
-                y_list.append(block(z[i : i + 1], y[i : i + 1]))
-            y_final: torch.Tensor = torch.cat(y_list, dim=0)
-        elif self.planning_loop.answer_update_block is not None:
-            y_final = self.planning_loop.answer_update_block(z, y)
-        else:
-            y_final = y
-        return y_final, bce_probs
+        return self.decode_answer(y), probabilities
 
     def forward_q(
-        self, X_raw: torch.Tensor, task_names: List[str] | None = None
+        self, x_raw: torch.Tensor, task_names: List[str] | None = None
     ) -> tuple[
-        torch.Tensor,
-        list[tuple[torch.Tensor, torch.Tensor]],
-        list[torch.Tensor],
+        torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]], list[torch.Tensor]
     ]:
-        """Forward pass coordinating warmup loops and final supervision loop for Q-learning.
-
-        Args:
-            X_raw: Raw input context of shape [B, L_raw, D]
-            task_names: Optional task prefix names for MoE routing.
-
-        Returns:
-            y_final: Final updated answer prediction state of shape [B, L_ans, D]
-            states: List of tuples (z, y) at each step of the supervision cycle.
-            q_preds: List of Q-value predictions from the ACT head for each step.
-        """
-        # X_raw: [batch_size, seq_len, d_model]
-        B, L_raw, D = X_raw.shape
-        z: torch.Tensor = self.M_meta.expand(B, -1, -1)  # [batch_size, n_meta, d_model]
-        y: torch.Tensor = self.init_answer(X_raw)  # [batch_size, l_ans, d_model]
-
-        # Warmup phase (T-1 cycles, no grad)
-        for c in range(1, self.t_cycles):
-            z, y = self.planning_loop(X_raw, z, y, warmup=True, task_names=task_names)
-
-        # Supervision cycle (T cycle, grad enabled)
+        """Return logits and the exact state/Q trajectory used by Q-learning."""
+        z, y = self._initialize(x_raw, task_names)
         if self.training:
-            num_steps: int = int(torch.randint(self.M_min, self.M_max + 1, (1,)).item())
+            num_steps = int(torch.randint(self.M_min, self.M_max + 1, (1,)).item())
         else:
-            num_steps = self.n_steps
-
-        q_preds: list[torch.Tensor] = []
+            num_steps = self.M_max
         states: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for i in range(1, num_steps + 1):
-            X_concat: torch.Tensor = torch.cat(
-                [z, y, X_raw], dim=1
-            )  # [batch_size, n_meta + l_ans + seq_len, d_model]
+        predictions: list[torch.Tensor] = []
+        for _ in range(num_steps):
+            x_concat = torch.cat([z, y, x_raw], dim=1)
             z = self.planning_loop.planning_block(
-                X_concat, causal=False, task_names=task_names
-            )[:, : self.n_meta, :]  # [batch_size, n_meta, d_model]
-
-            q_vals: torch.Tensor = self.q_head.get_q_values(z, y)  # [batch_size, 2]
-            q_preds.append(q_vals)
+                x_concat, causal=False, task_names=task_names
+            )[:, : self.n_meta, :]
+            y = self._update_answer(z, y, task_names)
             states.append((z, y))
-
-        if self.planning_loop.config.use_moe and self.planning_loop.answer_update_blocks is not None:
-            y_list = []
-            for i in range(y.shape[0]):
-                task = task_names[i] if task_names is not None else "MAZE"
-                if task not in self.planning_loop.answer_update_blocks:
-                    task = "MAZE"
-                from mamba_hybrid.answer_update import AnswerUpdateBlock
-                block = self.planning_loop.answer_update_blocks[task]
-                assert isinstance(block, AnswerUpdateBlock)
-                y_list.append(block(z[i : i + 1], y[i : i + 1]))
-            y_final: torch.Tensor = torch.cat(y_list, dim=0)
-        elif self.planning_loop.answer_update_block is not None:
-            y_final = self.planning_loop.answer_update_block(z, y)
-        else:
-            y_final = y
-        return y_final, states, q_preds
+            predictions.append(self.q_head.get_q_values(z, y))
+        return self.decode_answer(y), states, predictions

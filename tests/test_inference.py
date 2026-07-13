@@ -1,19 +1,20 @@
 import torch
-from unittest.mock import patch
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.model import MambaAttentionHybrid
-from mamba_hybrid.inference import ptrm_inference
+from mamba_hybrid.inference import ptrm_inference, select_consensus
 
 
 def test_ptrm_runs() -> None:
     """Verifies that the ptrm_inference function runs and returns the expected shape."""
-    config: MambaHybridConfig = MambaHybridConfig(d_model=64, n_meta=16, l_ans=8)
+    config: MambaHybridConfig = MambaHybridConfig(
+        d_model=64, n_meta=16, l_ans=8, vocab_size=71
+    )
     model: MambaAttentionHybrid = MambaAttentionHybrid(config)
     model.eval()
     x: torch.Tensor = torch.randn(2, 32, 64)  # [batch_size, seq_len, d_model]
     out: torch.Tensor = ptrm_inference(x, model, K=3, sigma_base=0.01)
     # Expected shape: [batch_size, l_ans, d_model]
-    assert out.shape == (2, 8, 64)
+    assert out.shape == (2, 8, 71)
 
 
 def test_ptrm_k_equals_1() -> None:
@@ -35,7 +36,7 @@ def test_ptrm_consensus_selection() -> None:
     """Verifies consensus majority selection and Q-score routing across candidates."""
     # Set up config
     config: MambaHybridConfig = MambaHybridConfig(
-        d_model=64, n_meta=16, l_ans=8, t_cycles=1, n_steps=2
+        d_model=64, n_meta=16, l_ans=8, t_cycles=1, n_steps=2, M_max=2
     )
     model: MambaAttentionHybrid = MambaAttentionHybrid(config)
     model.eval()
@@ -101,19 +102,34 @@ def test_ptrm_consensus_selection() -> None:
         idx: int = call_count - 1
         return rollout_scores[idx]
 
-    with (
-        patch.object(
-            model.planning_loop.answer_update_block,
-            "forward",
-            side_effect=mock_answer_update,
-        ),
-        patch.object(model.q_head, "forward", side_effect=mock_q_head),
-    ):
-        x: torch.Tensor = torch.randn(B, 16, D)
-        out: torch.Tensor = ptrm_inference(x, model, K=3, sigma_base=0.01)
+    logits = torch.zeros(3, B, L_ans, 5)
+    token_sequences = torch.tensor(
+        [
+            [[1] * L_ans, [3] * L_ans],
+            [[2] * L_ans, [4] * L_ans],
+            [[1] * L_ans, [4] * L_ans],
+        ]
+    )
+    logits.scatter_(-1, token_sequences.unsqueeze(-1), 1.0)
+    out = select_consensus(logits, torch.stack(rollout_scores))
 
-    assert out.shape == (2, L_ans, D)
+    assert out.shape == (2, L_ans, 5)
     # Check Batch 0 is cand_A (sum 10.0)
-    assert torch.allclose(out[0], cand_A)
+    assert torch.equal(out[0].argmax(dim=-1), logits[0, 0].argmax(dim=-1))
     # Check Batch 1 is cand_D (sum 40.0)
-    assert torch.allclose(out[1], cand_D)
+    assert torch.equal(out[1].argmax(dim=-1), logits[1, 1].argmax(dim=-1))
+
+
+def test_all_unique_consensus_uses_highest_score_and_restores_mode() -> None:
+    logits = torch.zeros(3, 1, 1, 3)
+    logits[0, 0, 0, 0] = 1.0
+    logits[1, 0, 0, 1] = 1.0
+    logits[2, 0, 0, 2] = 1.0
+    selected = select_consensus(logits, torch.tensor([[0.1], [0.9], [0.2]]))
+    assert selected.argmax(dim=-1).item() == 1
+
+    config = MambaHybridConfig(d_model=32, n_meta=4, l_ans=2, n_steps=1, M_max=1)
+    model = MambaAttentionHybrid(config).train()
+    first = ptrm_inference(torch.randn(1, 2, 32), model, K=1)
+    assert first.shape == (1, 2, config.vocab_size)
+    assert model.training

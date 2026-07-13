@@ -8,7 +8,7 @@ This guide provides the instructions and commands to train and evaluate the four
 
 All commands should be executed from the root directory of the repository (`/srv/mamba-attention-recursive-hybrid` on the remote server). 
 
-To ensure the virtual environment and dependencies are active, prefix python commands with `.venv/bin/python` or use `uv run`.
+Install dependencies with `uv sync`. Run every Python command through `uv run`; do not invoke the project virtual environment directly.
 
 ---
 
@@ -20,11 +20,11 @@ To prevent GPU Out-Of-Memory (OOM) errors on the single **NVIDIA RTX A1000 (8 GB
 Trains the model to solve 9x9 Sudoku boards using 2D row/column positional embeddings.
 * **Command (Background):**
   ```bash
-  nohup .venv/bin/python -u -m scripts.train_sudoku > /srv/sudoku_train.log 2>&1 &
+  nohup uv run python -u -m scripts.train_sudoku > /srv/sudoku_train.log 2>&1 &
   ```
 * **Command (Foreground):**
   ```bash
-  .venv/bin/python -u -m scripts.train_sudoku
+  uv run python -u -m scripts.train_sudoku
   ```
 * **Logs & Progress:** `/srv/sudoku_train.log`
 
@@ -33,11 +33,11 @@ Trains the model on a 30x30 grid (sequence length 900) using 2D positional embed
 To run this model on the RTX A1000 without OOM, the script uses a batch size of 4 and 8 gradient accumulation steps:
 * **Command (Background):**
   ```bash
-  nohup .venv/bin/python -u -m scripts.train_maze_laptop > /srv/maze_train.log 2>&1 &
+  nohup uv run python -u -m scripts.train_maze_laptop > /srv/maze_train.log 2>&1 &
   ```
 * **Command (Foreground):**
   ```bash
-  .venv/bin/python -u -m scripts.train_maze_laptop
+  uv run python -u -m scripts.train_maze_laptop
   ```
 * **Logs & Progress:** `/srv/maze_train.log`
 
@@ -45,11 +45,11 @@ To run this model on the RTX A1000 without OOM, the script uses a batch size of 
 Trains the model to find shortest path trees (SPT) on 20-node graphs using 1D positional embeddings.
 * **Command (Background):**
   ```bash
-  nohup .venv/bin/python -u -m scripts.train_dijkstra > /srv/dijkstra_train.log 2>&1 &
+  nohup uv run python -u -m scripts.train_dijkstra > /srv/dijkstra_train.log 2>&1 &
   ```
 * **Command (Foreground):**
   ```bash
-  .venv/bin/python -u -m scripts.train_dijkstra
+  uv run python -u -m scripts.train_dijkstra
   ```
 * **Logs & Progress:** `/srv/dijkstra_train.log`
 
@@ -57,12 +57,12 @@ Trains the model to find shortest path trees (SPT) on 20-node graphs using 1D po
 Trains a generalist sequence-to-sequence model handling Maze, Sudoku, Dijkstra, and GSM8K (math reasoning) using task-prefixed expert routing.
 * **Run on GPU (Ensure other GPU training is stopped):**
   ```bash
-  nohup .venv/bin/python -u -m scripts.train_multitask > /srv/multitask_train.log 2>&1 &
+  nohup uv run python -u -m scripts.train_multitask > /srv/multitask_train.log 2>&1 &
   ```
 * **Run on CPU (Forces PyTorch to run on host CPU to prevent OOM):**
   ```bash
   export CUDA_VISIBLE_DEVICES=""
-  nohup .venv/bin/python -u -m scripts.train_multitask > /srv/multitask_train.log 2>&1 &
+  nohup uv run python -u -m scripts.train_multitask > /srv/multitask_train.log 2>&1 &
   ```
 * **Logs & Progress:** `/srv/multitask_train.log`
 
@@ -94,17 +94,17 @@ After training, you can evaluate model accuracy using the diagnostics and evalua
 
 * **Evaluate Sudoku Checkpoint:**
   ```bash
-  .venv/bin/python -m scripts.diagnose_sudoku
+  uv run python -m scripts.evaluate_sudoku
   ```
 * **Evaluate Dijkstra Checkpoint:**
   ```bash
-  .venv/bin/python -m scripts.evaluate_dijkstra
+  uv run python -m scripts.evaluate_dijkstra
   ```
 * **Evaluate Maze Checkpoint:**
   ```bash
-  .venv/bin/python -m scripts.evaluate_maze
+  uv run python -m scripts.evaluate_maze
   ```
 * **Evaluate Multitask Unified Checkpoint:**
   ```bash
-  .venv/bin/python -m scripts.evaluate_multitask
+  uv run python -m scripts.evaluate_multitask
   ```

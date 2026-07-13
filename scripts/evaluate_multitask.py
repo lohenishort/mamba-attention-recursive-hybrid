@@ -4,6 +4,11 @@ from typing import List, Tuple
 
 from mamba_hybrid.config import MambaHybridConfig
 from scripts.train_multitask import UnifiedReasoningLLM, MultiTaskDataset
+from scripts.utils import (
+    config_from_dict,
+    exact_match,
+    load_validation_indices,
+)
 
 
 def decode_tokens(tokens: List[int]) -> str:
@@ -21,8 +26,7 @@ def main() -> None:
     data_dir = "data"
 
     if not os.path.exists(model_path):
-        print("Error: Trained model not found. Run train_multitask first.")
-        return
+        raise FileNotFoundError("Multitask checkpoint missing; train it first")
 
     device = torch.device(
         "xpu"
@@ -38,28 +42,35 @@ def main() -> None:
         and "state_dict" in checkpoint
         and "config" in checkpoint
     ):
-        config_dict = checkpoint["config"]
-        import inspect
-        sig = inspect.signature(MambaHybridConfig.__init__)
-        valid_keys = {k for k in sig.parameters.keys() if k != "self"}
-        filtered_config = {k: v for k, v in config_dict.items() if k in valid_keys}
-        config = MambaHybridConfig(**filtered_config)
+        config = config_from_dict(checkpoint["config"])
         state_dict = checkpoint["state_dict"]
     else:
         state_dict = checkpoint
         d_model = state_dict["embed.weight"].shape[1]
         n_meta = state_dict["reasoning_encoder.M_meta"].shape[1]
         config = MambaHybridConfig(
-            d_model=d_model, n_meta=n_meta, l_ans=128, n_steps=2, t_cycles=2
+            d_model=d_model,
+            n_meta=n_meta,
+            l_ans=128,
+            n_steps=2,
+            t_cycles=2,
+            vocab_size=128,
         )
 
     # Load dataset (returns inp_ids, tgt_ids, task_name)
     dataset = MultiTaskDataset(
-        data_dir, max_seq_len=128, l_ans=config.l_ans, max_samples_per_task=10
+        data_dir,
+        max_seq_len=int(checkpoint.get("max_seq_len", config.l_ans)),
+        l_ans=config.l_ans,
+        max_samples_per_task=100,
     )
 
     # Load model
-    model = UnifiedReasoningLLM(config, vocab_size=128).to(device)
+    model = UnifiedReasoningLLM(
+        config,
+        vocab_size=128,
+        max_seq_len=int(checkpoint.get("max_seq_len", config.l_ans)),
+    ).to(device)
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -71,7 +82,8 @@ def main() -> None:
         "GSM8K": [],
     }
 
-    for i in range(len(dataset)):
+    validation_indices = load_validation_indices(checkpoint)
+    for i in validation_indices:
         inp_ids, tgt_ids, task_name = dataset[i]
         if task_name in task_samples:
             task_samples[task_name].append((inp_ids, tgt_ids, task_name))
@@ -101,6 +113,26 @@ def main() -> None:
         print(f"  Input:     {short_inp}")
         print(f"  Expected:  {tgt_text}")
         print(f"  Predicted: {pred_text}")
+        exact = 0
+        token_correct = 0
+        token_total = 0
+        with torch.no_grad():
+            for sample_input, sample_target, sample_task in samples:
+                prediction = (
+                    model(sample_input.unsqueeze(0).to(device), [sample_task])[0]
+                    .argmax(-1)
+                    .cpu()
+                )
+                exact += int(
+                    exact_match(prediction, sample_target.unsqueeze(0), 0).item()
+                )
+                mask = sample_target.ne(0)
+                token_correct += int(
+                    prediction.squeeze(0)[mask].eq(sample_target[mask]).sum().item()
+                )
+                token_total += int(mask.sum().item())
+        print(f"  Held-out exact match: {exact / len(samples):.4f}")
+        print(f"  Held-out token accuracy: {token_correct / token_total:.4f}")
 
 
 if __name__ == "__main__":

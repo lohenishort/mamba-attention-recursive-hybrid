@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.loss import compute_bce_joint_loss
 from scripts.train_maze import MazeDataset, MazeReasoningModel
+from scripts.utils import deterministic_split_indices, exact_match, seed_everything
 
 
 def main() -> None:
@@ -28,24 +29,35 @@ def main() -> None:
         )
 
     # Configuration for 30x30 Maze Solver
-    l_ans = 64
+    raw_samples = torch.load(data_path)
+    grid_size = len(raw_samples[0]["grid"])
+    l_ans = max(len(sample["path"]) for sample in raw_samples)
     config = MambaHybridConfig(
-        d_model=128, n_meta=32, l_ans=l_ans, n_steps=4, t_cycles=3
+        d_model=128,
+        n_meta=32,
+        l_ans=l_ans,
+        n_steps=4,
+        t_cycles=3,
+        vocab_size=grid_size * grid_size + 1,
     )
 
     # Initialize dataset & dataloader (30x30 grid)
-    dataset = MazeDataset(data_path, size=30, max_path_len=l_ans)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+    dataset = MazeDataset(data_path, size=grid_size, max_path_len=l_ans)
+    seed = 42
+    generator = seed_everything(seed)
+    train_indices, validation_indices = deterministic_split_indices(len(dataset), seed)
+    train_set = torch.utils.data.Subset(dataset, train_indices)
+    val_set = torch.utils.data.Subset(dataset, validation_indices)
 
     batch_size = 4
     accumulation_steps = 8
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_set, batch_size=batch_size, shuffle=True, generator=generator
+    )
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
     # Initialize model & optimizer
-    model = MazeReasoningModel(config, grid_size=30).to(device)
+    model = MazeReasoningModel(config, grid_size=grid_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
 
     epochs = 30
@@ -65,21 +77,29 @@ def main() -> None:
 
             logits, bce_probs = model(grid_flat)
             preds = logits.argmax(dim=-1)
-            is_correct = (preds == target_ids).all(dim=-1)
+            is_correct = exact_match(preds, target_ids, grid_size * grid_size)
             correct_mask = is_correct.float()
-            loss = compute_bce_joint_loss(
-                logits, target_ids, bce_probs, correct_mask, alpha=1.0, ignore_index=900
-            ) / accumulation_steps
+            loss = (
+                compute_bce_joint_loss(
+                    logits,
+                    target_ids,
+                    bce_probs,
+                    correct_mask,
+                    alpha=1.0,
+                    ignore_index=grid_size * grid_size,
+                )
+                / accumulation_steps
+            )
 
             loss.backward()  # type: ignore[no-untyped-call]
 
-            if step % accumulation_steps == 0:
+            if step % accumulation_steps == 0 or step == len(train_loader):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
 
             total_loss += loss.item() * grid_flat.size(0) * accumulation_steps
-            correct_count += is_correct.sum().item()
+            correct_count += int(is_correct.sum().item())
             total_samples += grid_flat.size(0)
 
         train_loss = total_loss / total_samples
@@ -95,13 +115,18 @@ def main() -> None:
                 grid_flat, target_ids = grid_flat.to(device), target_ids.to(device)
                 logits, bce_probs = model(grid_flat)
                 preds = logits.argmax(dim=-1)
-                is_correct = (preds == target_ids).all(dim=-1)
+                is_correct = exact_match(preds, target_ids, grid_size * grid_size)
                 loss = compute_bce_joint_loss(
-                    logits, target_ids, bce_probs, is_correct.float(), alpha=1.0, ignore_index=900
+                    logits,
+                    target_ids,
+                    bce_probs,
+                    is_correct.float(),
+                    alpha=1.0,
+                    ignore_index=grid_size * grid_size,
                 )
 
                 val_loss += loss.item() * grid_flat.size(0)
-                val_correct += is_correct.sum().item()
+                val_correct += int(is_correct.sum().item())
                 val_samples += grid_flat.size(0)
 
         val_loss /= val_samples
@@ -113,7 +138,19 @@ def main() -> None:
         )
 
         os.makedirs("data", exist_ok=True)
-        torch.save(model.state_dict(), "data/maze_model.pt")
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "config": vars(config),
+                "grid_size": grid_size,
+                "max_path_len": l_ans,
+                "padding_index": grid_size * grid_size,
+                "dataset": data_path,
+                "seed": seed,
+                "validation_indices": validation_indices,
+            },
+            "data/maze_model.pt",
+        )
 
 
 if __name__ == "__main__":

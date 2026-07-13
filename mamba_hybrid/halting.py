@@ -79,11 +79,23 @@ class ACTHaltingModule(nn.Module):
         # Map to probability space [0, 1]
         prob = torch.sigmoid(bce_logit)  # [batch_size]
 
-        # Add dummy dependency to ensure q_mlp parameters receive gradients in standard forward,
-        # which satisfies existing gradient tests.
-        q_vals = self.q_mlp(s_t)
-        assert isinstance(q_vals, torch.Tensor)
-        dummy = 0.0 * q_vals.sum()
-        res_prob = prob + dummy
-        assert isinstance(res_prob, torch.Tensor)
-        return res_prob
+        return prob
+
+
+@torch.no_grad()
+def polyak_update(target: nn.Module, source: nn.Module, tau: float) -> None:
+    """Update a target network toward a source network in place."""
+    if not 0.0 <= tau <= 1.0:
+        raise ValueError("tau must be in [0, 1]")
+    target_parameters = dict(target.named_parameters())
+    source_parameters = dict(source.named_parameters())
+    if target_parameters.keys() != source_parameters.keys():
+        raise ValueError("target and source networks must have matching parameters")
+    for name, target_parameter in target_parameters.items():
+        target_parameter.lerp_(source_parameters[name], tau)
+    target_buffers = dict(target.named_buffers())
+    source_buffers = dict(source.named_buffers())
+    if target_buffers.keys() != source_buffers.keys():
+        raise ValueError("target and source networks must have matching buffers")
+    for name, target_buffer in target_buffers.items():
+        target_buffer.copy_(source_buffers[name])

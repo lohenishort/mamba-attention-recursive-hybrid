@@ -67,15 +67,16 @@ class TaskPrefixedMoeLayer(nn.Module):
         if task_names is None:
             # Fallback to MAZE expert if no task_names are provided (e.g. in tests/single-task runs)
             task_names = ["MAZE"] * B
+        if len(task_names) != B:
+            raise ValueError("task_names length must match batch size")
+        unknown = set(task_names) - set(self.experts.keys())
+        if unknown:
+            raise ValueError(f"unknown task_names: {sorted(unknown)}")
 
         out_list = []
         for i in range(B):
             task = task_names[i]
-            # If the task name is not registered, fallback to MAZE
-            if task in self.experts:
-                expert = self.experts[task]
-            else:
-                expert = self.experts["MAZE"]
+            expert = self.experts[task]
             out_sample = expert(x[i])
             out_list.append(out_sample)
 

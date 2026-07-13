@@ -2,8 +2,8 @@ import os
 import torch
 from typing import List
 
-from mamba_hybrid.config import MambaHybridConfig
 from scripts.train_dijkstra import DijkstraReasoningModel, DijkstraDataset
+from scripts.utils import config_from_dict, load_validation_indices
 
 
 def print_routing_tree(parents: List[int], distances: List[float]) -> None:
@@ -23,8 +23,9 @@ def main() -> None:
     data_path = "data/dijkstra.pt"
 
     if not os.path.exists(model_path) or not os.path.exists(data_path):
-        print("Error: Trained model or dataset not found. Run train_dijkstra first.")
-        return
+        raise FileNotFoundError(
+            "Dijkstra checkpoint or dataset missing; train it first"
+        )
 
     device = torch.device(
         "xpu"
@@ -35,28 +36,25 @@ def main() -> None:
 
     # Load checkpoint and config
     checkpoint = torch.load(model_path, map_location=device)
-    config_dict = checkpoint["config"]
-    config = MambaHybridConfig(
-        d_model=config_dict.get("d_model", 128),
-        n_meta=config_dict.get("n_meta", 32),
-        l_ans=config_dict.get("l_ans", 20),
-        n_steps=config_dict.get("n_steps", 4),
-        t_cycles=config_dict.get("t_cycles", 3),
-    )
+    config = config_from_dict(checkpoint["config"])
+    num_nodes = int(checkpoint["num_nodes"])
 
     # Initialize model
-    model = DijkstraReasoningModel(config, vocab_size=20).to(device)
+    model = DijkstraReasoningModel(config, vocab_size=int(checkpoint["vocab_size"])).to(
+        device
+    )
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
     # Load dataset
-    samples = []
-    if os.path.exists(data_path):
-        samples = torch.load(data_path)[:10]
-    dataset = DijkstraDataset(samples, augment=False, num_nodes=20, d_model=128)
+    all_samples = torch.load(data_path)
+    validation_indices = load_validation_indices(checkpoint)
+    dataset = DijkstraDataset(
+        all_samples, augment=False, num_nodes=num_nodes, d_model=config.d_model
+    )
 
     # Run evaluation on the first sample
-    input_feats, target_ids = dataset[0]
+    input_feats, target_ids = dataset[validation_indices[0]]
 
     with torch.no_grad():
         inp_batch = input_feats.unsqueeze(0).to(device)
@@ -64,7 +62,7 @@ def main() -> None:
         preds = logits.argmax(dim=-1).squeeze(0).tolist()
 
     # Get raw sample to read the actual distances
-    raw_data = torch.load(data_path)[0]
+    raw_data = all_samples[validation_indices[0]]
     distances = raw_data["distances"]
 
     print("\n=== PREDICTED ROUTING TREE ===")
@@ -77,6 +75,22 @@ def main() -> None:
     correct_nodes = sum(1 for p, t in zip(preds, target_ids.tolist()) if p == t)
     print(
         f"\nParent Node Prediction Accuracy: {correct_nodes}/20 ({correct_nodes / 20 * 100:.1f}%)"
+    )
+    node_correct = 0
+    graph_correct = 0
+    with torch.no_grad():
+        for index in validation_indices:
+            features, target = dataset[index]
+            prediction = (
+                model(features.unsqueeze(0).to(device))[0].argmax(-1).squeeze(0).cpu()
+            )
+            node_correct += int(prediction.eq(target).sum().item())
+            graph_correct += int(prediction.eq(target).all().item())
+    print(
+        f"Held-out node accuracy: {node_correct / (len(validation_indices) * num_nodes):.4f}"
+    )
+    print(
+        f"Held-out exact graph accuracy: {graph_correct / len(validation_indices):.4f}"
     )
 
 

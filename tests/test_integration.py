@@ -6,7 +6,7 @@ from mamba_hybrid.inference import ptrm_inference
 
 
 def test_integration_flow() -> None:
-    config = MambaHybridConfig(d_model=64, n_meta=16, l_ans=8)
+    config = MambaHybridConfig(d_model=64, n_meta=16, l_ans=8, vocab_size=64)
     model = MambaAttentionHybrid(config)
     x = torch.randn(2, 32, 64)
     # [batch_size, seq_len, d_model] = [2, 32, 64]

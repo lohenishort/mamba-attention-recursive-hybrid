@@ -17,7 +17,12 @@ def main() -> None:
     # Configuration for 30x30 Maze Solver overfit test
     l_ans = 64
     config = MambaHybridConfig(
-        d_model=64, n_meta=16, l_ans=l_ans, n_steps=2, t_cycles=2
+        d_model=64,
+        n_meta=16,
+        l_ans=l_ans,
+        n_steps=2,
+        t_cycles=2,
+        vocab_size=901,
     )
 
     # Load dataset and subset to first 5 samples
