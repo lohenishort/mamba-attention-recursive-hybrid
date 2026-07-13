@@ -26,7 +26,9 @@ def test_halting_gradients() -> None:
     assert z.grad is None
     assert y.grad is None
 
-    # Gradients on module parameters should be present
-    for p in module.parameters():
+    # BCE and Q heads are independent objectives; BCE must not fake Q gradients.
+    for p in module.bce_mlp.parameters():
         assert p.grad is not None
         assert not torch.isnan(p.grad).any()
+    for p in module.q_mlp.parameters():
+        assert p.grad is None

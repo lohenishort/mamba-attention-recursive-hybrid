@@ -16,7 +16,14 @@ def main() -> None:
     data_dir = "data"
 
     # Configuration for MultiTask overfit test
-    config = MambaHybridConfig(d_model=64, n_meta=16, l_ans=128, n_steps=2, t_cycles=2)
+    config = MambaHybridConfig(
+        d_model=64,
+        n_meta=16,
+        l_ans=128,
+        n_steps=2,
+        t_cycles=2,
+        vocab_size=128,
+    )
 
     # Initialize custom small dataset with exactly 1 sample per task
     class SmallMultiTaskDataset(

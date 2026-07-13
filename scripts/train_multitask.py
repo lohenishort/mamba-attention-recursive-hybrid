@@ -8,9 +8,12 @@ from typing import List, Tuple
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.model import MambaAttentionHybrid
 from mamba_hybrid.loss import compute_bce_joint_loss
+from scripts.utils import deterministic_split_indices, exact_match, seed_everything
 
 
-def tokenize_string(s: str, max_len: int) -> List[int]:
+def tokenize_string(
+    s: str, max_len: int, *, allow_truncation: bool = False
+) -> List[int]:
     """Converts a string to a list of ASCII token IDs, padded to max_len."""
     tokens = []
     for c in s:
@@ -20,8 +23,12 @@ def tokenize_string(s: str, max_len: int) -> List[int]:
         tokens.append(val)
     if len(tokens) < max_len:
         tokens += [0] * (max_len - len(tokens))
-    else:
+    elif allow_truncation:
         tokens = tokens[:max_len]
+    else:
+        raise ValueError(
+            f"Encoded text length {len(tokens)} exceeds configured limit {max_len}"
+        )
     return tokens
 
 
@@ -33,10 +40,17 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, str]]):
         max_seq_len: int = 128,
         l_ans: int = 128,
         max_samples_per_task: int = 100,
+        required_tasks: Tuple[str, ...] = ("MAZE", "SUDOKU", "DIJKSTRA", "GSM8K"),
     ) -> None:
         self.samples: List[Tuple[str, str, str]] = []
         self.max_seq_len = max_seq_len
         self.l_ans = l_ans
+        loaded_tasks: set[str] = set()
+
+        def add_sample(inp: str, tgt: str, task: str) -> None:
+            if len(inp) <= self.max_seq_len and len(tgt) <= self.l_ans:
+                self.samples.append((inp, tgt, task))
+                loaded_tasks.add(task)
 
         # 1. Maze
         maze_path = os.path.join(data_dir, "maze_dryrun.pt")
@@ -46,7 +60,7 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, str]]):
                 grid_str = "".join(str(int(val)) for row in s["grid"] for val in row)
                 inp = f"MAZE: {grid_str}"
                 tgt = "PATH: " + " ".join(f"({r},{c})" for r, c in s["path"])
-                self.samples.append((inp, tgt, "MAZE"))
+                add_sample(inp, tgt, "MAZE")
 
         # 2. Sudoku
         sudoku_path = os.path.join(data_dir, "sudoku.jsonl")
@@ -59,7 +73,7 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, str]]):
                     inp = f"SUDOKU: {grid_str}"
                     sol_str = "".join(str(val) for row in s["solution"] for val in row)
                     tgt = f"SOL: {sol_str}"
-                    self.samples.append((inp, tgt, "SUDOKU"))
+                    add_sample(inp, tgt, "SUDOKU")
                     count += 1
                     if count >= max_samples_per_task:
                         break
@@ -77,7 +91,7 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, str]]):
                             edges.append(f"{i}->{j}:{adj[i][j]:.1f}")
                 inp = "DIJKSTRA: " + ",".join(edges)
                 tgt = "DIST: " + " ".join(f"{d:.1f}" for d in s["distances"])
-                self.samples.append((inp, tgt, "DIJKSTRA"))
+                add_sample(inp, tgt, "DIJKSTRA")
 
         # 4. GSM8K
         gsm8k_path = os.path.join(data_dir, "gsm8k_train.jsonl")
@@ -88,10 +102,15 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, str]]):
                     s = json.loads(line)
                     inp = f"GSM8K: {s['question']}"
                     tgt = f"ANS: {s['answer']}"
-                    self.samples.append((inp, tgt, "GSM8K"))
+                    add_sample(inp, tgt, "GSM8K")
                     count += 1
                     if count >= max_samples_per_task:
                         break
+        missing = set(required_tasks) - loaded_tasks
+        if missing:
+            raise FileNotFoundError(
+                f"Missing required multitask datasets: {', '.join(sorted(missing))}"
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -109,42 +128,30 @@ class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, str]]):
 
 # --- 2. Unified Reasoning LLM Model with Task-Specific Heads ---
 class UnifiedReasoningLLM(nn.Module):
-    def __init__(self, config: MambaHybridConfig, vocab_size: int = 128) -> None:
+    def __init__(
+        self, config: MambaHybridConfig, vocab_size: int = 128, max_seq_len: int = 128
+    ) -> None:
         super().__init__()
         self.config = config
         self.embed = nn.Embedding(vocab_size, config.d_model)
         # Learnable 1D positional embeddings for input context
-        self.pos_embed = nn.Parameter(torch.randn(1, 128, config.d_model))
+        self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len, config.d_model))
         self.reasoning_encoder = MambaAttentionHybrid(config)
 
-        # Task-specific projection heads to prevent multi-task representation interference
-        self.heads = nn.ModuleDict(
-            {
-                "MAZE": nn.Linear(config.d_model, vocab_size),
-                "SUDOKU": nn.Linear(config.d_model, vocab_size),
-                "DIJKSTRA": nn.Linear(config.d_model, vocab_size),
-                "GSM8K": nn.Linear(config.d_model, vocab_size),
-            }
-        )
+        if config.vocab_size != vocab_size:
+            raise ValueError("config.vocab_size must match the multitask vocabulary")
 
     def forward(
         self, input_ids: torch.Tensor, task_names: List[str]
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         # input_ids shape: [B, L_raw]
-        B = input_ids.shape[0]
-        X_raw = self.embed(input_ids) + self.pos_embed[:, :input_ids.shape[1], :]  # [B, L_raw, D]
-        y_final, bce_probs = self.reasoning_encoder(X_raw, task_names=task_names)  # [B, l_ans, D]
-
-        # Route each sample in the batch to its respective task-specific head
-        logits_list = []
-        for i in range(B):
-            task = task_names[i]
-            # y_final[i] shape: [l_ans, D]
-            logits_sample = self.heads[task](y_final[i])  # [l_ans, vocab_size]
-            logits_list.append(logits_sample)
-
-        logits = torch.stack(logits_list, dim=0)  # [B, l_ans, vocab_size]
-        return logits, bce_probs
+        X_raw = (
+            self.embed(input_ids) + self.pos_embed[:, : input_ids.shape[1], :]
+        )  # [B, L_raw, D]
+        output: Tuple[torch.Tensor, List[torch.Tensor]] = self.reasoning_encoder(
+            X_raw, task_names=task_names
+        )
+        return output
 
 
 # --- 3. Main Training Driver ---
@@ -160,13 +167,23 @@ def main() -> None:
 
     # Set up config with max answer length (128 for GSM8K)
     l_ans = 128
+    max_seq_len = 2048
     config = MambaHybridConfig(
-        d_model=64, n_meta=16, l_ans=l_ans, n_steps=2, t_cycles=2, use_moe=True
+        d_model=64,
+        n_meta=16,
+        l_ans=l_ans,
+        n_steps=2,
+        t_cycles=2,
+        use_moe=True,
+        vocab_size=128,
     )
 
     # Initialize Dataset (load 100 samples per task to train fast on CPU)
     dataset = MultiTaskDataset(
-        data_dir, max_seq_len=128, l_ans=l_ans, max_samples_per_task=100
+        data_dir,
+        max_seq_len=max_seq_len,
+        l_ans=l_ans,
+        max_samples_per_task=100,
     )
     if len(dataset) == 0:
         print(
@@ -176,15 +193,21 @@ def main() -> None:
 
     print(f"Loaded total of {len(dataset)} multi-task samples.")
 
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+    seed = 42
+    generator = seed_everything(seed)
+    train_indices, validation_indices = deterministic_split_indices(len(dataset), seed)
+    train_set = torch.utils.data.Subset(dataset, train_indices)
+    val_set = torch.utils.data.Subset(dataset, validation_indices)
 
-    train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=16, shuffle=False)
+    train_loader = DataLoader(
+        train_set, batch_size=1, shuffle=True, generator=generator
+    )
+    val_loader = DataLoader(val_set, batch_size=1, shuffle=False)
 
     # Initialize Unified Model
-    model = UnifiedReasoningLLM(config, vocab_size=128).to(device)
+    model = UnifiedReasoningLLM(config, vocab_size=128, max_seq_len=max_seq_len).to(
+        device
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
 
     epochs = 5
@@ -203,7 +226,7 @@ def main() -> None:
 
             # Accuracy on non-padding tokens
             preds = logits.argmax(dim=-1)
-            is_correct = (preds == target_ids).all(dim=-1)
+            is_correct = exact_match(preds, target_ids, 0)
             correct_mask = is_correct.float()
 
             loss = compute_bce_joint_loss(
@@ -214,7 +237,7 @@ def main() -> None:
             optimizer.step()
 
             total_loss += loss.item() * input_ids.size(0)
-            correct_count += is_correct.sum().item()
+            correct_count += int(is_correct.sum().item())
             total_samples += input_ids.size(0)
 
         train_loss = total_loss / total_samples
@@ -230,13 +253,18 @@ def main() -> None:
                 input_ids, target_ids = input_ids.to(device), target_ids.to(device)
                 logits, bce_probs = model(input_ids, task_names)
                 preds = logits.argmax(dim=-1)
-                is_correct = (preds == target_ids).all(dim=-1)
+                is_correct = exact_match(preds, target_ids, 0)
                 loss = compute_bce_joint_loss(
-                    logits, target_ids, bce_probs, is_correct.float(), alpha=1.0, ignore_index=0
+                    logits,
+                    target_ids,
+                    bce_probs,
+                    is_correct.float(),
+                    alpha=1.0,
+                    ignore_index=0,
                 )
 
                 val_loss += loss.item() * input_ids.size(0)
-                val_correct += is_correct.sum().item()
+                val_correct += int(is_correct.sum().item())
                 val_samples += input_ids.size(0)
 
         val_loss /= val_samples
@@ -249,7 +277,14 @@ def main() -> None:
     # Save checkpoint
     os.makedirs("data", exist_ok=True)
     torch.save(
-        {"state_dict": model.state_dict(), "config": vars(config)},
+        {
+            "state_dict": model.state_dict(),
+            "config": vars(config),
+            "seed": seed,
+            "validation_indices": validation_indices,
+            "max_seq_len": max_seq_len,
+            "tasks": sorted(dataset.samples[index][2] for index in range(len(dataset))),
+        },
         "data/unified_model.pt",
     )
     print(

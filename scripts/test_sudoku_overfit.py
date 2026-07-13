@@ -24,7 +24,9 @@ def main() -> None:
                 break
 
     # We use a smaller model for fast overfit testing
-    config = MambaHybridConfig(d_model=64, n_meta=16, l_ans=81, n_steps=2, t_cycles=2)
+    config = MambaHybridConfig(
+        d_model=64, n_meta=16, l_ans=81, n_steps=2, t_cycles=2, vocab_size=10
+    )
 
     dataset = SudokuDataset(samples, augment=False)
     loader = DataLoader(dataset, batch_size=5, shuffle=False)

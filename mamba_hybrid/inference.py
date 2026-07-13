@@ -1,6 +1,36 @@
 import math
+from typing import cast
+
 import torch
+
 from mamba_hybrid.model import MambaAttentionHybrid
+
+
+def select_consensus(logits: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+    """Select per-batch logits by exact-token majority, then score ties. [K,B,L,V]."""
+    rollouts, batch_size, _, _ = logits.shape
+    token_ids = logits.argmax(dim=-1)
+    selected: list[torch.Tensor] = []
+    for batch_index in range(batch_size):
+        groups: dict[tuple[int, ...], list[int]] = {}
+        for rollout in range(rollouts):
+            key = tuple(
+                int(token) for token in token_ids[rollout, batch_index].tolist()
+            )
+            groups.setdefault(key, []).append(rollout)
+        largest_size = max(len(indices) for indices in groups.values())
+        eligible = [
+            rollout
+            for indices in groups.values()
+            if len(indices) == largest_size
+            for rollout in indices
+        ]
+        best = max(
+            eligible,
+            key=lambda rollout: float(scores[rollout, batch_index].item()),
+        )
+        selected.append(logits[best, batch_index])
+    return torch.stack(selected, dim=0)
 
 
 def ptrm_inference(
@@ -11,112 +41,46 @@ def ptrm_inference(
     max_noise_step: int = 20,
     task_names: list[str] | None = None,
 ) -> torch.Tensor:
-    """Probabilistic Tiny Recursive Model (PTRM) inference with majority-consensus voting.
-
-    Args:
-        input_ids: Raw input context of shape [B, L_raw, D]
-        model: The trained MambaAttentionHybrid model.
-        K: Number of stochastic rollouts to sample.
-        sigma_base: Base standard deviation for Gaussian noise injection.
-        max_noise_step: Maximum step index (1-based, across cycles) to inject noise.
-
-    Returns:
-        best_output: Consensus-selected answer predictions of shape [B, L_ans, D]
-    """
-    # input_ids: [batch_size, seq_len, d_model]
-    B, L_raw, D = input_ids.shape
-
-    if K == 1:
+    """Run batched stochastic rollouts and vote on exact decoded token sequences."""
+    if K <= 0:
+        raise ValueError("K must be positive")
+    if sigma_base < 0.0 or max_noise_step < 0:
+        raise ValueError("noise parameters must be non-negative")
+    batch_size = input_ids.shape[0]
+    model._validate_tasks(task_names, batch_size)
+    was_training = model.training
+    model.eval()
+    try:
         with torch.no_grad():
-            y_final: torch.Tensor
-            y_final, _ = model(input_ids, task_names=task_names)
-            return y_final
+            if K == 1:
+                logits, _ = model(input_ids, task_names=task_names)
+                return cast(torch.Tensor, logits)
 
-    candidates: list[torch.Tensor] = []
-    scores: list[torch.Tensor] = []
-
-    with torch.no_grad():
-        for k in range(K):
-            # z: [batch_size, n_meta, d_model]
-            z: torch.Tensor = model.M_meta.expand(B, -1, -1)
-            # y: [batch_size, l_ans, d_model]
-            y: torch.Tensor = model.init_answer(input_ids)
-
-            for c in range(1, model.t_cycles + 1):
-                for i in range(1, model.n_steps + 1):
-                    step_idx: int = (c - 1) * model.n_steps + i
-                    if step_idx <= max_noise_step:
-                        # Compute step-dependent noise scale
-                        sigma: float = sigma_base * math.sqrt(1.0 - i / model.n_steps)
-                        z = z + torch.randn_like(z) * sigma
-
-                    # X_concat: [batch_size, n_meta + l_ans + seq_len, d_model]
-                    X_concat: torch.Tensor = torch.cat([z, y, input_ids], dim=1)
-                    # Update planning state z: [batch_size, n_meta, d_model]
+            expanded_input = (
+                input_ids.unsqueeze(0)
+                .expand(K, -1, -1, -1)
+                .reshape(K * batch_size, input_ids.shape[1], input_ids.shape[2])
+            )
+            expanded_tasks = task_names * K if task_names is not None else None
+            z = model.M_meta.expand(K * batch_size, -1, -1)
+            y = model.init_answer(expanded_input)
+            for cycle in range(1, model.t_cycles + 1):
+                for step in range(1, model.n_steps + 1):
+                    global_step = (cycle - 1) * model.n_steps + step
+                    if global_step <= max_noise_step:
+                        fraction = 1.0 - (step / model.n_steps)
+                        z = z + torch.randn_like(z) * sigma_base * math.sqrt(fraction)
+                    x_concat = torch.cat([z, y, expanded_input], dim=1)
                     z = model.planning_loop.planning_block(
-                        X_concat, causal=False, task_names=task_names
+                        x_concat, causal=False, task_names=expanded_tasks
                     )[:, : model.n_meta, :]
-                # Update answer state y: [batch_size, l_ans, d_model]
-                if model.planning_loop.config.use_moe and model.planning_loop.answer_update_blocks is not None:
-                    y_list = []
-                    for i in range(y.shape[0]):
-                        task = task_names[i] if task_names is not None else "MAZE"
-                        if task not in model.planning_loop.answer_update_blocks:
-                            task = "MAZE"
-                        y_list.append(model.planning_loop.answer_update_blocks[task](z[i : i + 1], y[i : i + 1]))
-                    y = torch.cat(y_list, dim=0)
-                elif model.planning_loop.answer_update_block is not None:
-                    y = model.planning_loop.answer_update_block(z, y)
-                else:
-                    y = y
+                y = model._update_answer(z, y, expanded_tasks)
 
-            # prob: [batch_size]
-            prob: torch.Tensor = model.q_head(z, y)
-            candidates.append(y)
-            scores.append(prob)
+            logits = model.decode_answer(y).reshape(
+                K, batch_size, model.l_ans, model.config.vocab_size
+            )
+            scores = model.q_head(z, y).reshape(K, batch_size)
 
-    # Consensus Voting Selection
-    stacked_cand: torch.Tensor = torch.stack(candidates, dim=0)  # [K, B, L_ans, D]
-    stacked_scores: torch.Tensor = torch.stack(scores, dim=0)  # [K, B]
-
-    best_outputs: list[torch.Tensor] = []
-    for b in range(B):
-        # batch_cands: [K, L_ans, D]
-        batch_cands: torch.Tensor = stacked_cand[:, b]
-        # batch_scores: [K]
-        batch_scores: torch.Tensor = stacked_scores[:, b]
-
-        # Group candidates based on similarity using pairwise MSE/L2 distance
-        groups: dict[int, list[int]] = {}
-        unique_representatives: list[int] = []
-        epsilon: float = 1e-4
-        for k in range(K):
-            matched: bool = False
-            for idx, rep in enumerate(unique_representatives):
-                mse: float = float(
-                    torch.mean((batch_cands[k] - batch_cands[rep]) ** 2).item()
-                )
-                if mse < epsilon:
-                    groups[idx].append(k)
-                    matched = True
-                    break
-            if not matched:
-                new_idx: int = len(unique_representatives)
-                unique_representatives.append(k)
-                groups[new_idx] = [k]
-
-        # Find the group with the largest number of members
-        largest_group_idx: int = max(groups.keys(), key=lambda idx: len(groups[idx]))
-        consensus_idx: list[int] = groups[largest_group_idx]
-
-        # Select candidate within the consensus group with the highest score
-        best_k: int = consensus_idx[0]
-        best_s: torch.Tensor = batch_scores[best_k]
-        for k in consensus_idx:
-            if batch_scores[k] > best_s:
-                best_s = batch_scores[k]
-                best_k = k
-        best_outputs.append(batch_cands[best_k])
-
-    # [batch_size, l_ans, d_model]
-    return torch.stack(best_outputs, dim=0)
+        return select_consensus(logits, scores)
+    finally:
+        model.train(was_training)

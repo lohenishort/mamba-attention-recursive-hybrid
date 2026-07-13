@@ -7,28 +7,43 @@ from typing import List, Tuple, Dict, Any
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.model import MambaAttentionHybrid
 from mamba_hybrid.loss import compute_bce_joint_loss
+from scripts.utils import (
+    deterministic_split_indices,
+    exact_match,
+    seed_everything,
+)
 
 
 # --- 1. Custom Dataset for Dijkstra ---
 import random
 
-def augment_dijkstra(adj: List[List[float]], parents: List[int]) -> Tuple[List[List[float]], List[int]]:
+
+def augment_dijkstra(
+    adj: List[List[float]], parents: List[int]
+) -> Tuple[List[List[float]], List[int]]:
     N = len(adj)
     perm = list(range(N))
-    random.shuffle(perm)
-    
+    source = next((i for i, parent in enumerate(parents) if parent == -1), 0)
+    movable = [i for i in range(N) if i != source]
+    shuffled = movable.copy()
+    random.shuffle(shuffled)
+    for old, new in zip(movable, shuffled):
+        perm[old] = new
+    perm[source] = source
+
     new_adj = [[0.0] * N for _ in range(N)]
     for i in range(N):
         for j in range(N):
             new_adj[perm[i]][perm[j]] = adj[i][j]
-            
+
     new_parents = [-1] * N
     for i in range(N):
         p = parents[i]
         if p != -1:
             new_parents[perm[i]] = perm[p]
-            
+
     return new_adj, new_parents
+
 
 class DijkstraDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
     def __init__(
@@ -78,22 +93,23 @@ class DijkstraReasoningModel(nn.Module):
         self.config = config
         self.pos_embed = nn.Parameter(torch.randn(1, 20, config.d_model))
         self.reasoning_encoder = MambaAttentionHybrid(config)
-        self.token_generator = nn.Linear(config.d_model, vocab_size)
+        if config.vocab_size != vocab_size:
+            raise ValueError("config.vocab_size must match the Dijkstra vocabulary")
 
     def forward(self, X_raw: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         # X_raw shape: [B, 20, D] (continuous graph adjacency rows)
         X_raw = X_raw + self.pos_embed
-        y_final, bce_probs = self.reasoning_encoder(X_raw)  # [B, 20, D]
-        logits = self.token_generator(y_final)  # [B, 20, vocab_size]
-        return logits, bce_probs
+        output: Tuple[torch.Tensor, List[torch.Tensor]] = self.reasoning_encoder(X_raw)
+        return output
 
 
 # --- 3. Main Training Driver ---
 def main() -> None:
     data_path = "data/dijkstra.pt"
     if not os.path.exists(data_path):
-        print(f"Error: {data_path} not found. Please run download_all_datasets first.")
-        return
+        raise FileNotFoundError(
+            f"{data_path} not found; run `uv run python -m scripts.download_all_datasets`"
+        )
 
     device = torch.device(
         "xpu"
@@ -105,7 +121,7 @@ def main() -> None:
     # Configure model for exactly 20 answer slots (parents of the 20 nodes)
     l_ans = 20
     config = MambaHybridConfig(
-        d_model=128, n_meta=32, l_ans=l_ans, n_steps=4, t_cycles=3
+        d_model=128, n_meta=32, l_ans=l_ans, n_steps=4, t_cycles=3, vocab_size=20
     )
 
     # Load all Dijkstra samples
@@ -114,16 +130,22 @@ def main() -> None:
         all_samples = torch.load(data_path)[:1000]
 
     # Shuffle and split
-    random.seed(42)
-    random.shuffle(all_samples)
-    train_size = int(0.8 * len(all_samples))
-    train_samples = all_samples[:train_size]
-    val_samples_list = all_samples[train_size:]
+    seed = 42
+    generator = seed_everything(seed)
+    train_indices, validation_indices = deterministic_split_indices(
+        len(all_samples), seed
+    )
+    train_samples = [all_samples[index] for index in train_indices]
+    val_samples_list = [all_samples[index] for index in validation_indices]
 
     train_set = DijkstraDataset(train_samples, augment=True, num_nodes=20, d_model=128)
-    val_set = DijkstraDataset(val_samples_list, augment=False, num_nodes=20, d_model=128)
+    val_set = DijkstraDataset(
+        val_samples_list, augment=False, num_nodes=20, d_model=128
+    )
 
-    train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
+    train_loader = DataLoader(
+        train_set, batch_size=16, shuffle=True, generator=generator
+    )
     val_loader = DataLoader(val_set, batch_size=16, shuffle=False)
 
     # Initialize model & optimizer
@@ -146,7 +168,7 @@ def main() -> None:
 
             # Check if predicted parent tree matches solution exactly
             preds = logits.argmax(dim=-1)
-            is_correct = (preds == target_ids).all(dim=-1)
+            is_correct = exact_match(preds, target_ids)
             correct_mask = is_correct.float()
 
             loss = compute_bce_joint_loss(
@@ -158,7 +180,7 @@ def main() -> None:
             optimizer.step()
 
             total_loss += loss.item() * input_feats.size(0)
-            correct_count += is_correct.sum().item()
+            correct_count += int(is_correct.sum().item())
             total_samples += input_feats.size(0)
 
         train_loss = total_loss / total_samples
@@ -174,13 +196,13 @@ def main() -> None:
                 input_feats, target_ids = input_feats.to(device), target_ids.to(device)
                 logits, bce_probs = model(input_feats)
                 preds = logits.argmax(dim=-1)
-                is_correct = (preds == target_ids).all(dim=-1)
+                is_correct = exact_match(preds, target_ids)
                 loss = compute_bce_joint_loss(
                     logits, target_ids, bce_probs, is_correct.float(), alpha=1.0
                 )
 
                 val_loss += loss.item() * input_feats.size(0)
-                val_correct += is_correct.sum().item()
+                val_correct += int(is_correct.sum().item())
                 val_samples += input_feats.size(0)
 
         val_loss /= val_samples
@@ -193,7 +215,15 @@ def main() -> None:
     # Save the model
     os.makedirs("data", exist_ok=True)
     torch.save(
-        {"state_dict": model.state_dict(), "config": vars(config)},
+        {
+            "state_dict": model.state_dict(),
+            "config": vars(config),
+            "seed": seed,
+            "validation_indices": validation_indices,
+            "dataset": data_path,
+            "num_nodes": 20,
+            "vocab_size": 20,
+        },
         "data/dijkstra_model.pt",
     )
     print("Successfully saved trained model state dict to data/dijkstra_model.pt")

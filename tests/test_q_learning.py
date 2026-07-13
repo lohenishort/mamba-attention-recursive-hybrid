@@ -1,7 +1,9 @@
 import torch
+import pytest
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.model import MambaAttentionHybrid
 from mamba_hybrid.loss import compute_q_joint_loss
+from mamba_hybrid.halting import polyak_update
 
 
 def test_q_learning_flow() -> None:
@@ -13,10 +15,12 @@ def test_q_learning_flow() -> None:
     targets = torch.randint(0, 64, (2, 8))
 
     # Mock running Q forward
-    y_final, _, q_preds = model.forward_q(x)
+    y_final, states, q_preds = model.forward_q(x)
     correct_mask = torch.tensor([1.0, 0.0])
 
-    loss = compute_q_joint_loss(y_final, targets, q_preds, correct_mask, target_model)
+    loss = compute_q_joint_loss(
+        y_final, targets, q_preds, correct_mask, target_model, states=states
+    )
     assert loss > 0
 
 
@@ -73,8 +77,8 @@ def test_q_learning_gradients_initial_params() -> None:
     # Eval mode
     model_bounds.eval()
     _, states_eval, q_preds_eval = model_bounds.forward_q(x)
-    assert len(states_eval) == 6
-    assert len(q_preds_eval) == 6
+    assert len(states_eval) == 5
+    assert len(q_preds_eval) == 5
 
     # Train mode
     model_bounds.train()
@@ -87,3 +91,26 @@ def test_q_learning_gradients_initial_params() -> None:
         steps_observed.add(num_steps)
     # Check that we observed at least some variety to confirm randomization
     assert len(steps_observed) > 1
+
+
+def test_q_loss_rejects_missing_trajectory_states() -> None:
+    config = MambaHybridConfig(d_model=64, n_meta=4, l_ans=2, n_steps=1, M_max=1)
+    model = MambaAttentionHybrid(config)
+    logits, _, q_preds = model.forward_q(torch.randn(1, 2, 64))
+    with pytest.raises(ValueError, match="states"):
+        compute_q_joint_loss(
+            logits,
+            torch.zeros(1, 2, dtype=torch.long),
+            q_preds,
+            torch.ones(1),
+            model,
+        )
+
+
+def test_polyak_update_interpolates_parameters() -> None:
+    source = torch.nn.Linear(2, 1, bias=False)
+    target = torch.nn.Linear(2, 1, bias=False)
+    source.weight.data.fill_(1.0)
+    target.weight.data.zero_()
+    polyak_update(target, source, tau=0.25)
+    assert torch.allclose(target.weight, torch.full_like(target.weight, 0.25))

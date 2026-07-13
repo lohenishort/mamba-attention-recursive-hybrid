@@ -8,6 +8,7 @@ try:
     HAS_CUDA_KERNELS = True
 except ImportError:
     HAS_CUDA_KERNELS = False
+    mamba_chunk_scan_combined = None
 
 
 class Mamba2SSDScan(nn.Module):
@@ -58,8 +59,8 @@ class Mamba2SSDScan(nn.Module):
         """
         B, L, _ = x.shape
 
-        # delta step sizes: [B, L, num_heads]
-        delta_sig: torch.Tensor = torch.sigmoid(delta)
+        # Positive continuous-time step sizes: [B, L, num_heads]
+        delta_pos: torch.Tensor = torch.nn.functional.softplus(delta)
 
         # Split input and output state projections: [B, L, num_heads, d_state]
         h_in_split: torch.Tensor = h_in.view(B, L, self.num_heads, self.d_state)
@@ -74,6 +75,7 @@ class Mamba2SSDScan(nn.Module):
                 raise RuntimeError(
                     "CUDA kernels are not available. Please install mamba-ssm or disable use_cuda_kernels."
                 )
+            assert mamba_chunk_scan_combined is not None
             # A parameter set to a constant tensor of -1.0
             A: torch.Tensor = torch.full(
                 (self.num_heads,), -1.0, device=x.device, dtype=x.dtype
@@ -81,11 +83,12 @@ class Mamba2SSDScan(nn.Module):
             # Call Triton kernel. Returns [B, L, num_heads, d_head]
             y: torch.Tensor = mamba_chunk_scan_combined(
                 x_split,
-                delta_sig,
+                delta,
                 A,
                 h_in_split,
                 h_out_split,
                 chunk_size=256,
+                dt_softplus=True,
             )
             # Reshape output and apply gate
             y_ssm: torch.Tensor = y.reshape(B, L, self.ssm_dim) * torch.sigmoid(gate)
@@ -99,14 +102,16 @@ class Mamba2SSDScan(nn.Module):
 
             for t in range(L):
                 # Step size for the current time step: [B, num_heads, 1]
-                dt: torch.Tensor = delta_sig[:, t].unsqueeze(-1)
+                dt: torch.Tensor = delta_pos[:, t].unsqueeze(-1)
                 dt_uns: torch.Tensor = dt.unsqueeze(-1)
 
                 bt: torch.Tensor = h_in_split[:, t].unsqueeze(-1)
                 xt: torch.Tensor = x_split[:, t].unsqueeze(-2)
 
-                # State update: h_t = (1 - dt) * h_{t-1} + dt * (bt * xt)
-                h = (1.0 - dt_uns) * h + dt_uns * (bt * xt)
+                # Zero-order-hold SSD recurrence with A fixed to -1 per head.
+                decay: torch.Tensor = torch.exp(-dt_uns)
+                # Exact zero-order-hold discretization for A=-1.
+                h = decay * h + (1.0 - decay) * (bt * xt)
 
                 # Readout calculation
                 ct: torch.Tensor = h_out_split[:, t].unsqueeze(-1)

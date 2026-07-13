@@ -8,6 +8,14 @@ dependencies = [
     "torch>=2.0.0",
 ]
 
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project.optional-dependencies]
+cuda = ["torch>=2.7.0", "torchvision", "torchaudio"]
+xpu  = ["torch>=2.13.0,<2.14.0", "torchvision", "torchaudio", "triton-xpu"]
+
 [dependency-groups]
 dev = [
     "pytest>=7.0.0",
@@ -17,3 +25,41 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = "."
+
+[tool.maturin]
+manifest-path = "native/Cargo.toml"
+module-name = "mamba_hybrid._native"
+python-source = "."
+features = ["pyo3/extension-module"]
+
+[tool.uv]
+conflicts = [
+    [{ extra = "cuda" }, { extra = "xpu" }],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cuda", extra = "cuda" },
+    { index = "pytorch-xpu",  extra = "xpu" },
+]
+torchvision = [
+    { index = "pytorch-cuda", extra = "cuda" },
+    { index = "pytorch-xpu",  extra = "xpu" },
+]
+torchaudio = [
+    { index = "pytorch-cuda", extra = "cuda" },
+    { index = "pytorch-xpu",  extra = "xpu" },
+]
+triton-xpu = [
+    { index = "pytorch-xpu", extra = "xpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true

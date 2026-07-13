@@ -8,27 +8,31 @@ from typing import List, Tuple, Dict, Any
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.model import MambaAttentionHybrid
 from mamba_hybrid.loss import compute_bce_joint_loss
+from scripts.utils import deterministic_split_indices, seed_everything
 
 
 # --- 1. Custom Dataset for Sudoku ---
 import random
 
-def augment_sudoku(puzzle: List[List[int]], solution: List[List[int]]) -> Tuple[List[int], List[int]]:
+
+def augment_sudoku(
+    puzzle: List[List[int]], solution: List[List[int]]
+) -> Tuple[List[int], List[int]]:
     # 1. Permute numbers 1-9
     digits = list(range(1, 10))
     shuffled = digits.copy()
     random.shuffle(shuffled)
-    mapping = {i: shuffled[i-1] for i in range(1, 10)}
+    mapping = {i: shuffled[i - 1] for i in range(1, 10)}
     mapping[0] = 0
-    
+
     p_grid = [[mapping[val] for val in row] for row in puzzle]
     s_grid = [[mapping[val] for val in row] for row in solution]
-    
+
     # 2. Transposition (50% chance)
     if random.random() < 0.5:
         p_grid = [list(x) for x in zip(*p_grid)]
         s_grid = [list(x) for x in zip(*s_grid)]
-        
+
     # 3. Flips (horizontal / vertical)
     if random.random() < 0.5:
         p_grid = p_grid[::-1]
@@ -36,10 +40,11 @@ def augment_sudoku(puzzle: List[List[int]], solution: List[List[int]]) -> Tuple[
     if random.random() < 0.5:
         p_grid = [row[::-1] for row in p_grid]
         s_grid = [row[::-1] for row in s_grid]
-        
+
     p_flat = [val for row in p_grid for val in row]
     s_flat = [val for row in s_grid for val in row]
     return p_flat, s_flat
+
 
 class SudokuDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
     def __init__(self, samples: List[Dict[str, Any]], augment: bool = False) -> None:
@@ -53,14 +58,16 @@ class SudokuDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
         sample = self.samples[idx]
         puzzle = sample["puzzle"]  # 9x9 list of ints
         solution = sample["solution"]  # 9x9 list of ints
-        
+
         if self.augment:
             puzzle_flat, solution_flat = augment_sudoku(puzzle, solution)
         else:
             puzzle_flat = [val for row in puzzle for val in row]
             solution_flat = [val for row in solution for val in row]
-        
-        return torch.tensor(puzzle_flat, dtype=torch.long), torch.tensor(solution_flat, dtype=torch.long)
+
+        return torch.tensor(puzzle_flat, dtype=torch.long), torch.tensor(
+            solution_flat, dtype=torch.long
+        )
 
 
 # --- 2. Sudoku Reasoning Model ---
@@ -73,7 +80,8 @@ class SudokuReasoningModel(nn.Module):
         self.row_embed = nn.Parameter(torch.randn(9, config.d_model // 2))
         self.col_embed = nn.Parameter(torch.randn(9, config.d_model // 2))
         self.reasoning_encoder = MambaAttentionHybrid(config)
-        self.token_generator = nn.Linear(config.d_model, vocab_size)
+        if config.vocab_size != vocab_size:
+            raise ValueError("config.vocab_size must match the Sudoku vocabulary")
 
     def forward(
         self, input_ids: torch.Tensor
@@ -82,12 +90,16 @@ class SudokuReasoningModel(nn.Module):
         B = input_ids.size(0)
         row_pos = self.row_embed.unsqueeze(1).expand(-1, 9, -1)  # [9, 9, D // 2]
         col_pos = self.col_embed.unsqueeze(0).expand(9, -1, -1)  # [9, 9, D // 2]
-        pos_2d = torch.cat([row_pos, col_pos], dim=-1).view(81, -1).unsqueeze(0).expand(B, -1, -1)
-        
+        pos_2d = (
+            torch.cat([row_pos, col_pos], dim=-1)
+            .view(81, -1)
+            .unsqueeze(0)
+            .expand(B, -1, -1)
+        )
+
         X_raw = self.embed(input_ids) + pos_2d  # [B, 81, D]
-        y_final, bce_probs = self.reasoning_encoder(X_raw)  # [B, 81, D]
-        logits = self.token_generator(y_final)  # [B, 81, vocab_size]
-        return logits, bce_probs
+        output: Tuple[torch.Tensor, List[torch.Tensor]] = self.reasoning_encoder(X_raw)
+        return output
 
 
 # --- 3. Main Training Driver ---
@@ -107,7 +119,7 @@ def main() -> None:
     # Configure model for exactly 81 answer slots
     l_ans = 81
     config = MambaHybridConfig(
-        d_model=128, n_meta=32, l_ans=l_ans, n_steps=4, t_cycles=3
+        d_model=128, n_meta=32, l_ans=l_ans, n_steps=4, t_cycles=3, vocab_size=10
     )
 
     # Load all Sudoku samples
@@ -119,16 +131,20 @@ def main() -> None:
                 break
 
     # Shuffle and split
-    random.seed(42)
-    random.shuffle(all_samples)
-    train_size = int(0.8 * len(all_samples))
-    train_samples = all_samples[:train_size]
-    val_samples_list = all_samples[train_size:]
+    seed = 42
+    generator = seed_everything(seed)
+    train_indices, validation_indices = deterministic_split_indices(
+        len(all_samples), seed
+    )
+    train_samples = [all_samples[index] for index in train_indices]
+    val_samples_list = [all_samples[index] for index in validation_indices]
 
     train_set = SudokuDataset(train_samples, augment=True)
     val_set = SudokuDataset(val_samples_list, augment=False)
 
-    train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
+    train_loader = DataLoader(
+        train_set, batch_size=32, shuffle=True, generator=generator
+    )
     val_loader = DataLoader(val_set, batch_size=32, shuffle=False)
 
     # Initialize model & optimizer
@@ -194,13 +210,20 @@ def main() -> None:
 
         print(
             f"Epoch {epoch:02d}/{epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}",
-            flush=True
+            flush=True,
         )
 
         # Save checkpoint at the end of each epoch to prevent data loss
         os.makedirs("data", exist_ok=True)
         torch.save(
-            {"state_dict": model.state_dict(), "config": vars(config)},
+            {
+                "state_dict": model.state_dict(),
+                "config": vars(config),
+                "seed": seed,
+                "dataset": data_path,
+                "validation_indices": validation_indices,
+                "vocab_size": 10,
+            },
             "data/sudoku_model.pt",
         )
 

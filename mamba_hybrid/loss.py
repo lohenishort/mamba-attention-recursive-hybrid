@@ -2,7 +2,16 @@
 
 import torch
 import torch.nn.functional as F
-from typing import Any
+from typing import Protocol
+
+
+class _QHead(Protocol):
+    def get_q_values(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor: ...
+
+
+class _TargetModel(Protocol):
+    @property
+    def q_head(self) -> _QHead: ...
 
 
 def compute_bce_joint_loss(
@@ -16,7 +25,7 @@ def compute_bce_joint_loss(
     """Computes the joint loss combining sparse task CE and BCE halting head loss.
 
     Args:
-        y_final: Final sequence predictions. Shape: [batch_size, seq_len, d_model]
+        y_final: Final vocabulary logits. Shape: [batch_size, seq_len, vocab_size]
         target_ids: Target token IDs. Shape: [batch_size, seq_len]
         bce_probs: Probabilities from the halting head for each recursive step.
             List of length `n_steps`, where each tensor has shape [batch_size].
@@ -33,8 +42,12 @@ def compute_bce_joint_loss(
     # correct_mask: [batch_size]
     # Each prob in bce_probs: [batch_size]
 
-    B, L_ans, D = y_final.shape
-    loss_task = F.cross_entropy(y_final.view(-1, D), target_ids.view(-1), ignore_index=ignore_index)
+    _, _, vocab_size = y_final.shape
+    loss_task = F.cross_entropy(
+        y_final.reshape(-1, vocab_size),
+        target_ids.reshape(-1),
+        ignore_index=ignore_index,
+    )
 
     loss_bce = torch.tensor(0.0, device=y_final.device)
     n_steps = len(bce_probs)
@@ -56,7 +69,7 @@ def compute_q_joint_loss(
     target_ids: torch.Tensor,
     q_preds: list[torch.Tensor],
     correct_mask: torch.Tensor,
-    target_model: Any,
+    target_model: _TargetModel,
     alpha: float = 1.0,
     gamma: float = 1.0,
     states: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
@@ -85,35 +98,35 @@ def compute_q_joint_loss(
     # target_ids: [batch_size, seq_len]
     # correct_mask: [batch_size]
     # Each pred in q_preds: [batch_size, 2]
-    B, L_ans, D = y_final.shape
-    loss_task = F.cross_entropy(y_final.view(-1, D), target_ids.view(-1), ignore_index=ignore_index)
+    _, _, vocab_size = y_final.shape
+    loss_task = F.cross_entropy(
+        y_final.reshape(-1, vocab_size),
+        target_ids.reshape(-1),
+        ignore_index=ignore_index,
+    )
 
     loss_q = torch.tensor(0.0, device=y_final.device)
     n_steps = len(q_preds)
 
     if n_steps > 0:
+        if states is None or len(states) != n_steps:
+            raise ValueError("states must contain one state for every Q prediction")
+        if correct_mask.ndim == 1:
+            rewards = correct_mask.unsqueeze(0).expand(n_steps, -1)
+        elif correct_mask.shape == (n_steps, y_final.shape[0]):
+            rewards = correct_mask
+        else:
+            raise ValueError("correct_mask must have shape [B] or [steps, B]")
         for t in range(n_steps):
-            q_halt_target = correct_mask.to(y_final.device)
+            q_halt_target = rewards[t].to(y_final.device)
+            q_cont_target: torch.Tensor | None = None
             if t < n_steps - 1:
-                # Get next state and run target model
-                if states is not None and t + 1 < len(states):
-                    next_z, next_y = states[t + 1]
-                else:
-                    # fallback simulation if states not provided or not fully populated
-                    # next_z: [B, n_meta, D], next_y: [B, l_ans, D]
-                    B = y_final.shape[0]
-                    D = y_final.shape[2]
-                    next_z = torch.zeros(B, target_model.n_meta, D, device=y_final.device)
-                    next_y = torch.zeros(B, target_model.l_ans, D, device=y_final.device)
-
+                next_z, next_y = states[t + 1]
                 with torch.no_grad():
-                    # target_model.q_head.get_q_values: [batch_size, 2]
                     q_next = target_model.q_head.get_q_values(
                         next_z.to(y_final.device), next_y.to(y_final.device)
                     )
                 q_cont_target = gamma * torch.max(q_next, dim=-1)[0]
-            else:
-                q_cont_target = correct_mask.to(y_final.device)
 
             # q_preds[t]: [batch_size, 2]
             # Column 1 represents Q(s_t, halt), Column 0 represents Q(s_t, continue)
@@ -122,6 +135,7 @@ def compute_q_joint_loss(
                 + (q_preds[t][:, 1].to(y_final.device) - q_halt_target).pow(2).mean()
             )
             if t < n_steps - 1:
+                assert q_cont_target is not None
                 loss_q = (
                     loss_q
                     + (q_preds[t][:, 0].to(y_final.device) - q_cont_target)

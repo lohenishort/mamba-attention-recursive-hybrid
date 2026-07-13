@@ -16,10 +16,10 @@ def main() -> None:
 
     # Load all Dijkstra samples
     all_samples = torch.load(data_path)
-    
+
     # We use a smaller model for fast overfit testing
     config = MambaHybridConfig(
-        d_model=64, n_meta=16, l_ans=20, n_steps=2, t_cycles=2
+        d_model=64, n_meta=16, l_ans=20, n_steps=2, t_cycles=2, vocab_size=20
     )
 
     full_dataset = DijkstraDataset(all_samples, augment=False, num_nodes=20, d_model=64)

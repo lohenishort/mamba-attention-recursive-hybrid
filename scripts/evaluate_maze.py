@@ -1,10 +1,14 @@
-import os
 import torch
 from typing import List, Dict, Any, Tuple
 
-from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.inference import ptrm_inference
 from scripts.train_maze import MazeReasoningModel, MazeDataset
+from scripts.utils import (
+    config_from_dict,
+    exact_match,
+    load_validation_indices,
+    require_file,
+)
 
 
 def print_maze(
@@ -52,9 +56,7 @@ def main() -> None:
     model_path = "data/maze_model.pt"
     data_path = "data/maze_dryrun.pt"
 
-    if not os.path.exists(model_path) or not os.path.exists(data_path):
-        print("Error: Trained model or dataset not found. Run train_maze first.")
-        return
+    require_file(model_path)
 
     device = torch.device(
         "xpu"
@@ -63,25 +65,26 @@ def main() -> None:
     )
     print(f"Loading test environment on {device}...")
 
-    # Initialize config (must match training parameters)
-    l_ans = 16
-    config = MambaHybridConfig(
-        d_model=64, n_meta=16, l_ans=l_ans, n_steps=2, t_cycles=2
-    )
+    checkpoint = torch.load(model_path, map_location=device)
+    config = config_from_dict(checkpoint["config"])
+    grid_size = int(checkpoint["grid_size"])
+    data_path = str(checkpoint.get("dataset", data_path))
+    require_file(data_path)
 
     # Load dataset
     raw_data: List[Dict[str, Any]] = torch.load(data_path)
-    dataset = MazeDataset(data_path, size=10, max_path_len=l_ans)
+    dataset = MazeDataset(data_path, size=grid_size, max_path_len=config.l_ans)
 
     # Load model
-    model = MazeReasoningModel(config, grid_size=10).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model = MazeReasoningModel(config, grid_size=grid_size).to(device)
+    model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
     print("\n--- Running Evaluation with PTRM Consensus Selection ---")
 
     # Pick a random sample
-    idx = 0
+    validation_indices = load_validation_indices(checkpoint)
+    idx = validation_indices[0]
     grid_flat, target_ids = dataset[idx]
 
     # Prepare input tensor for ptrm_inference
@@ -105,28 +108,25 @@ def main() -> None:
 
         # Run PTRM consensus voting inference with K=5 rollouts
         # This calls ptrm_inference which stochastically samples trajectories and filters them
-        y_final = ptrm_inference(
+        logits = ptrm_inference(
             X_raw, model.reasoning_encoder, K=5, sigma_base=0.01
-        )  # [1, l_ans, d_model]
-
-        # Project representation to token vocabulary
-        logits = model.token_generator(y_final)  # [1, l_ans, vocab_size]
+        )  # [1, l_ans, vocab_size]
         preds = logits.argmax(dim=-1).squeeze(0)  # [l_ans]
 
     # Decode predicted tokens back to coordinates
     pred_path: List[Tuple[int, int]] = []
     for token in preds.tolist():
-        if token < 100:  # Valid cell token
-            r = token // 10
-            c = token % 10
+        if token < grid_size * grid_size:  # Valid cell token
+            r = token // grid_size
+            c = token % grid_size
             pred_path.append((r, c))
 
     # Remove padding from target path
     true_path_tokens = target_ids.tolist()
     true_path = []
     for token in true_path_tokens:
-        if token < 100:
-            true_path.append((token // 10, token % 10))
+        if token < grid_size * grid_size:
+            true_path.append((token // grid_size, token % grid_size))
 
     print("\n[Ground Truth Path]:", true_path)
     print("[Predicted Path]:   ", pred_path)
@@ -134,6 +134,26 @@ def main() -> None:
     print("\nVisualizing Maze Solving:")
     print("S = Start, E = End, · = Truth, * = Predicted Path (Match)")
     print_maze(raw_data[idx]["grid"], true_path, pred_path)
+
+    exact = 0
+    tokens_correct = 0
+    tokens_total = 0
+    with torch.no_grad():
+        for held_out_index in validation_indices:
+            grid, target = dataset[held_out_index]
+            prediction = model(grid.unsqueeze(0).to(device))[0].argmax(-1).cpu()
+            exact += int(
+                exact_match(
+                    prediction, target.unsqueeze(0), grid_size * grid_size
+                ).item()
+            )
+            mask = target.ne(grid_size * grid_size)
+            tokens_correct += int(
+                prediction.squeeze(0)[mask].eq(target[mask]).sum().item()
+            )
+            tokens_total += int(mask.sum().item())
+    print(f"Held-out exact match: {exact}/{len(validation_indices)}")
+    print(f"Held-out path-token accuracy: {tokens_correct / tokens_total:.4f}")
 
 
 if __name__ == "__main__":

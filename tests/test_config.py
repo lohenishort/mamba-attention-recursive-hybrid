@@ -11,3 +11,8 @@ def test_config_defaults() -> None:
     assert config.use_cuda_kernels is False
     assert config.M_min == 1
     assert config.M_max == 6
+
+
+def test_config_allows_halting_horizon_beyond_cycle_length() -> None:
+    config = MambaHybridConfig(n_steps=2, M_max=3)
+    assert config.M_max == 3

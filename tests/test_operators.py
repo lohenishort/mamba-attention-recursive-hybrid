@@ -101,9 +101,7 @@ def test_moe_layer_and_block() -> None:
     assert not torch.isnan(x.grad).any()
 
     # 2. Test MambaAttentionHybridBlock with MoE enabled
-    config = MambaHybridConfig(
-        d_model=64, n_meta=16, use_moe=True
-    )
+    config = MambaHybridConfig(d_model=64, n_meta=16, use_moe=True)
     block = MambaAttentionHybridBlock(config)
     assert block.moe is not None
 
