@@ -1,10 +1,16 @@
 """Maze move encoding and path-level validation."""
 
 from dataclasses import dataclass
+from typing import cast
 
+import numpy as np
+import numpy.typing as npt
 import torch
 
-from mamba_hybrid.evaluation import validate_maze_path
+from mamba_hybrid.evaluation import (
+    validate_maze_moves_array,
+    validate_maze_path,
+)
 
 PAD = 0
 EOS = 1
@@ -102,15 +108,20 @@ def maze_correct_mask(
     start_values = starts if starts is not None else [(0, 0)] * batch_size
     size = grids.shape[1]
     goal_values = goals if goals is not None else [(size - 1, size - 1)] * batch_size
-    results = [
-        decode_moves(
-            predictions[index].tolist(),
-            grids[index].tolist(),
-            start=start_values[index],
-            goal=goal_values[index],
-        ).legal
-        for index in range(batch_size)
-    ]
+    prediction_values = cast(
+        npt.NDArray[np.int64],
+        predictions.detach().to(device="cpu", dtype=torch.long).contiguous().numpy(),
+    )
+    grid_values = cast(
+        npt.NDArray[np.int64],
+        grids.detach().to(device="cpu", dtype=torch.long).contiguous().numpy(),
+    )
+    results = validate_maze_moves_array(
+        prediction_values,
+        grid_values,
+        np.asarray(start_values, dtype=np.int64),
+        np.asarray(goal_values, dtype=np.int64),
+    )
     return torch.tensor(results, dtype=torch.bool, device=predictions.device)
 
 

@@ -1,9 +1,13 @@
 import math
 
+import numpy as np
 import pytest
 
+import mamba_hybrid.evaluation as evaluation
 from mamba_hybrid.evaluation import (
     select_consensus,
+    select_consensus_array,
+    validate_maze_moves_array,
     validate_maze_path,
     validate_sudoku_board,
 )
@@ -102,6 +106,31 @@ def test_consensus_all_unique_uses_global_confidence() -> None:
     assert select_consensus([[1], [2], [3]], [0.4, 0.9, 0.8]) == 1
 
 
+def test_batch_consensus_matches_python_fallback() -> None:
+    candidates = [
+        [[1, 2], [3]],
+        [[9], [4]],
+        [[1, 2], [4]],
+    ]
+    fixed_length_candidates = [
+        [[1, 2], [3, 3]],
+        [[9, 9], [4, 4]],
+        [[1, 2], [4, 4]],
+    ]
+    confidences = [[0.2, 0.7], [0.99, 0.5], [0.8, 0.1]]
+
+    expected = evaluation._py_select_consensus_batch(candidates, confidences)
+
+    assert expected == [2, 1]
+    assert (
+        select_consensus_array(
+            np.asarray(fixed_length_candidates, dtype=np.int64),
+            np.asarray(confidences, dtype=np.float32),
+        )
+        == expected
+    )
+
+
 @pytest.mark.parametrize("scores", [[], [0.0, math.nan]])
 def test_consensus_rejects_invalid_input(scores: list[float]) -> None:
     with pytest.raises(ValueError):
@@ -119,6 +148,42 @@ def test_maze_supports_explicit_endpoints_and_wall_value() -> None:
     assert validate_maze_path(
         [[7, 0], [7, 0]], [(0, 1), (1, 1)], start=(0, 1), goal=(1, 1), wall_value=7
     )
+
+
+def test_native_maze_arrays_match_python_fallback() -> None:
+    predictions = [[5, 3, 1], [5, 3, 1]]
+    grids = [[[0, 0], [1, 0]], [[0, 1], [0, 0]]]
+    starts = [(0, 0), (0, 0)]
+    goals = [(1, 1), (1, 1)]
+
+    expected = evaluation._py_validate_maze_moves_batch(
+        predictions, grids, starts, goals
+    )
+
+    assert (
+        validate_maze_moves_array(
+            np.asarray(predictions, dtype=np.int64),
+            np.asarray(grids, dtype=np.int64),
+            np.asarray(starts, dtype=np.int64),
+            np.asarray(goals, dtype=np.int64),
+        )
+        == expected
+    )
+
+
+def test_array_helpers_work_without_native_extension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(evaluation, "NATIVE_AVAILABLE", False)
+    candidates = np.asarray([[[1]], [[2]], [[1]]], dtype=np.int64)
+    scores = np.asarray([[0.2], [0.9], [0.8]], dtype=np.float32)
+    predictions = np.asarray([[5, 3, 1]], dtype=np.int64)
+    grids = np.asarray([[[0, 0], [1, 0]]], dtype=np.int64)
+    starts = np.asarray([[0, 0]], dtype=np.int64)
+    goals = np.asarray([[1, 1]], dtype=np.int64)
+
+    assert select_consensus_array(candidates, scores) == [2]
+    assert validate_maze_moves_array(predictions, grids, starts, goals) == [True]
 
 
 def test_sudoku_board_validation_and_clues() -> None:

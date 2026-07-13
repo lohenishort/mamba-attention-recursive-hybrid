@@ -49,6 +49,10 @@ class PlanningLoop(nn.Module):
                 unknown = set(task_names) - set(self.answer_update_blocks.keys())
                 if unknown:
                     raise ValueError(f"unknown task_names: {sorted(unknown)}")
+                if len(set(task_names)) == 1:
+                    block = self.answer_update_blocks[task_names[0]]
+                    assert isinstance(block, AnswerUpdateBlock)
+                    return cast(torch.Tensor, block(z, y))
                 y_list = []
                 for i in range(y.shape[0]):
                     task = task_names[i]
