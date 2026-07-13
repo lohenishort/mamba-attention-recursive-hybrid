@@ -2,6 +2,7 @@ import torch
 
 from mamba_hybrid.config import MambaHybridConfig
 from scripts.train_dijkstra import DijkstraReasoningModel
+from scripts.train_gsm8k import GSM8KReasoningModel
 from scripts.train_maze import MazeReasoningModel
 from scripts.train_multitask import NativeMultiTaskModel
 from scripts.train_sudoku import SudokuReasoningModel, sudoku_completion_targets
@@ -90,3 +91,91 @@ def test_sudoku_completion_targets_supervise_only_blanks() -> None:
     targets = sudoku_completion_targets(puzzle, solution)
 
     assert torch.equal(targets, torch.tensor([[-100, 7, -100, 2]]))
+
+
+def test_task_cycle_logits_only_track_gradients_for_final_cycle() -> None:
+    config = MambaHybridConfig(
+        d_model=8,
+        n_meta=2,
+        l_ans=4,
+        n_steps=1,
+        M_min=1,
+        M_max=2,
+        vocab_size=259,
+    )
+
+    maze = MazeReasoningModel(config, grid_size=2)
+    maze_logits, _ = maze.forward_cycle_logits(
+        torch.zeros(1, 4, dtype=torch.long),
+        torch.tensor([[maze.bos_token, 0, 0, 0]]),
+    )
+
+    dijkstra = DijkstraReasoningModel(config, num_nodes=4)
+    dijkstra_logits, _ = dijkstra.forward_cycle_logits(
+        torch.zeros(1, 4, 4),
+        torch.zeros(1, dtype=torch.long),
+        torch.tensor([[dijkstra.bos_token, 0, 0, 0]]),
+    )
+
+    sudoku = SudokuReasoningModel(config)
+    sudoku_logits, _ = sudoku.forward_cycle_logits(
+        torch.zeros(1, 81, dtype=torch.long),
+        torch.cat(
+            [
+                torch.tensor([[sudoku.bos_token]]),
+                torch.full((1, 80), sudoku.pad_token, dtype=torch.long),
+            ],
+            dim=1,
+        ),
+    )
+
+    gsm8k = GSM8KReasoningModel(config, max_question_bytes=8, max_answer_length=4)
+    gsm8k_logits, _ = gsm8k.forward_cycle_logits(
+        torch.tensor([[49, 258]]),
+        torch.ones(1, 2, dtype=torch.bool),
+        torch.tensor([[256, 50]]),
+    )
+
+    for cycle_logits in [maze_logits, dijkstra_logits, sudoku_logits, gsm8k_logits]:
+        assert len(cycle_logits) == 2
+        assert cycle_logits[0].requires_grad is False
+        assert cycle_logits[-1].requires_grad is True
+
+
+def test_sudoku_cached_generation_preserves_position_dependent_clues() -> None:
+    config = MambaHybridConfig(
+        d_model=8, n_meta=2, l_ans=81, n_steps=1, M_max=1, vocab_size=10
+    )
+    model = SudokuReasoningModel(config).eval()
+    puzzle = torch.zeros(1, 81, dtype=torch.long)
+    puzzle[0, [0, 17, 40, 80]] = torch.tensor([8, 3, 5, 9])
+
+    logits, _ = model(puzzle)
+
+    assert logits.shape == (1, 81, 10)
+    assert torch.equal(logits.argmax(dim=-1)[puzzle.ne(0)], puzzle[puzzle.ne(0)])
+
+
+def test_dijkstra_cached_generation_preserves_per_node_parent_constraints() -> None:
+    config = MambaHybridConfig(
+        d_model=8, n_meta=2, l_ans=4, n_steps=1, M_max=1, vocab_size=5
+    )
+    model = DijkstraReasoningModel(config, num_nodes=4).eval()
+    adjacency = torch.tensor(
+        [
+            [
+                [0.0, 1.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ]
+        ]
+    )
+
+    generated, _ = model.generate(adjacency, torch.tensor([0]))
+
+    assert generated.shape == (1, 4)
+    assert generated[0, 0].item() == 0
+    assert generated[0, 1].item() in {0, 2, 4}
+    assert generated[0, 2].item() in {1, 4}
+    assert generated[0, 3].item() == 4

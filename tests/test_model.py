@@ -1,7 +1,12 @@
+from copy import deepcopy
 import torch
 from unittest.mock import patch
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.model import MambaAttentionHybrid
+
+
+def test_activation_checkpointing_defaults_disabled() -> None:
+    assert MambaHybridConfig().activation_checkpointing is False
 
 
 def test_model_e2e_forward() -> None:
@@ -255,3 +260,78 @@ def test_act_halts_at_minimum_and_validates_tasks() -> None:
             assert "unknown task_names" in str(error)
         else:
             raise AssertionError("invalid task name was accepted")
+
+
+def test_cycle_checkpoint_matches_outputs_gradients_and_rng() -> None:
+    base_config = MambaHybridConfig(
+        d_model=8,
+        n_meta=2,
+        l_ans=2,
+        n_steps=2,
+        M_min=1,
+        M_max=2,
+        vocab_size=7,
+        use_moe=True,
+        activation_checkpointing=False,
+    )
+    checkpoint_config = MambaHybridConfig(
+        d_model=8,
+        n_meta=2,
+        l_ans=2,
+        n_steps=2,
+        M_min=1,
+        M_max=2,
+        vocab_size=7,
+        use_moe=True,
+        activation_checkpointing=True,
+    )
+    base_model = MambaAttentionHybrid(base_config).train()
+    checkpoint_model = MambaAttentionHybrid(checkpoint_config).train()
+    checkpoint_model.load_state_dict(deepcopy(base_model.state_dict()))
+    base_input = torch.randn(2, 4, 8, requires_grad=True)
+    checkpoint_input = base_input.detach().clone().requires_grad_(True)
+    x_mask = torch.tensor([[True, True, True, False], [True, True, False, False]])
+    task_names = ["MAZE", "SUDOKU"]
+
+    torch.manual_seed(2026)
+    base_logits, base_probabilities = base_model(
+        base_input, task_names=task_names, x_mask=x_mask
+    )
+    base_loss = base_logits.square().sum() + sum(
+        probability.square().sum() for probability in base_probabilities
+    )
+    base_loss.backward()
+    base_next_random = torch.rand(())
+
+    torch.manual_seed(2026)
+    checkpoint_logits, checkpoint_probabilities = checkpoint_model(
+        checkpoint_input, task_names=task_names, x_mask=x_mask
+    )
+    checkpoint_loss = checkpoint_logits.square().sum() + sum(
+        probability.square().sum() for probability in checkpoint_probabilities
+    )
+    checkpoint_loss.backward()
+    checkpoint_next_random = torch.rand(())
+
+    assert torch.allclose(checkpoint_logits, base_logits, atol=1e-6)
+    for checkpoint_probability, base_probability in zip(
+        checkpoint_probabilities, base_probabilities
+    ):
+        assert torch.allclose(checkpoint_probability, base_probability, atol=1e-6)
+    assert base_input.grad is not None
+    assert checkpoint_input.grad is not None
+    assert torch.allclose(checkpoint_input.grad, base_input.grad, atol=1e-5)
+    assert torch.equal(checkpoint_next_random, base_next_random)
+
+    base_parameters = dict(base_model.named_parameters())
+    checkpoint_parameters = dict(checkpoint_model.named_parameters())
+    for name in ("M_meta", "y_pos_embed", "ans_init_proj.weight"):
+        base_gradient = base_parameters[name].grad
+        checkpoint_gradient = checkpoint_parameters[name].grad
+        assert base_gradient is not None
+        assert checkpoint_gradient is not None
+        assert torch.allclose(
+            checkpoint_gradient,
+            base_gradient,
+            atol=1e-5,
+        )

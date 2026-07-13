@@ -27,13 +27,13 @@ class PrefixCausalAttention(nn.Module):
 
     def forward(
         self,
-        q: torch.Tensor,  # [B, num_heads, L, d_head]
-        k: torch.Tensor,  # [B, num_heads, L, d_head]
-        v: torch.Tensor,  # [B, num_heads, L, d_head]
+        q: torch.Tensor,  # [B, num_heads, L_q, d_head]
+        k: torch.Tensor,  # [B, num_heads, L_kv, d_head]
+        v: torch.Tensor,  # [B, num_heads, L_kv, d_head]
         causal: bool = False,
         valid_mask: torch.Tensor | None = None,  # [B, L]
         prefix_length: int | None = None,
-    ) -> torch.Tensor:  # [B, L, d_model]
+    ) -> torch.Tensor:  # [B, L_q, d_model]
         """
         Forward pass for prefix-causal attention.
 
@@ -46,14 +46,19 @@ class PrefixCausalAttention(nn.Module):
         Returns:
             Output tensor of shape [B, L, d_model]
         """
-        B, num_heads, L, d_head = q.shape
+        B, num_heads, query_length, d_head = q.shape
+        key_length = k.shape[2]
+        if k.shape != (B, num_heads, key_length, d_head) or v.shape != k.shape:
+            raise ValueError(
+                "q, k, and v must have matching batch, head, and head dimensions"
+            )
 
         # Compute scaled dot-product attention scores
         # scores shape: [B, num_heads, L, L]
         scores: torch.Tensor = torch.matmul(q, k.transpose(-2, -1)) / (d_head**0.5)
 
         if valid_mask is not None:
-            if valid_mask.shape != (B, L):
+            if valid_mask.shape != (B, key_length):
                 raise ValueError("valid_mask must have shape [batch_size, seq_len]")
             scores = scores.masked_fill(
                 ~valid_mask[:, None, None, :].to(device=q.device, dtype=torch.bool),
@@ -61,24 +66,30 @@ class PrefixCausalAttention(nn.Module):
             )
 
         if causal:
+            if query_length != key_length:
+                raise ValueError(
+                    "causal attention requires equal query and key lengths"
+                )
             prefix = self.n_meta if prefix_length is None else prefix_length
-            if not 0 <= prefix <= L:
+            if not 0 <= prefix <= key_length:
                 raise ValueError("prefix_length must be between 0 and seq_len")
             # Initialize mask to zero (no attention allowed by default)
-            mask: torch.Tensor = torch.zeros(L, L, device=q.device)
+            mask: torch.Tensor = torch.zeros(key_length, key_length, device=q.device)
 
             # Effective meta-token count (in case sequence length is smaller than n_meta)
-            eff_n_meta: int = min(prefix, L)
+            eff_n_meta: int = min(prefix, key_length)
 
             # 1. Meta-tokens can attend to all meta-tokens bidirectionally
             mask[:eff_n_meta, :eff_n_meta] = 1.0
 
-            if L > prefix:
+            if key_length > prefix:
                 # 2. Subsequent tokens can attend to all meta-tokens
                 mask[prefix:, :prefix] = 1.0
                 # 3. Subsequent tokens can attend to themselves and prior subsequent tokens causally
                 mask[prefix:, prefix:] = torch.tril(
-                    torch.ones(L - prefix, L - prefix, device=q.device)
+                    torch.ones(
+                        key_length - prefix, key_length - prefix, device=q.device
+                    )
                 )
 
             # Apply mask: fill 0s with -inf to prevent attention
@@ -93,7 +104,9 @@ class PrefixCausalAttention(nn.Module):
         # Weighted sum over values
         # y_attn shape: [B, L, d_model]
         y_attn: torch.Tensor = (
-            torch.matmul(attn_weights, v).transpose(1, 2).reshape(B, L, self.d_model)
+            torch.matmul(attn_weights, v)
+            .transpose(1, 2)
+            .reshape(B, query_length, self.d_model)
         )
 
         # Final output projection

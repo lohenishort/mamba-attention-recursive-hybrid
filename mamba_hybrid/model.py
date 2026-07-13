@@ -2,6 +2,7 @@ from typing import List, cast
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.halting import ACTHaltingModule
@@ -96,6 +97,52 @@ class MambaAttentionHybrid(nn.Module):
         y = self.init_answer(x_raw, x_mask)
         return z, y
 
+    def _execute_cycle(
+        self,
+        x_raw: torch.Tensor,
+        state: PlanningState,
+        cycle_index: int,
+        task_names: List[str] | None,
+        x_mask: torch.Tensor | None,
+    ) -> PlanningState:
+        """Execute one complete planner cycle, optionally recomputing it in backward."""
+        z, y = state
+        cycle_tasks = None if task_names is None else list(task_names)
+
+        def run_cycle(
+            context: torch.Tensor, z_state: torch.Tensor, y_state: torch.Tensor
+        ) -> PlanningState:
+            return cast(
+                PlanningState,
+                self.planning_loop(
+                    context,
+                    z_state,
+                    y_state,
+                    warmup=False,
+                    task_names=cycle_tasks,
+                    x_mask=x_mask,
+                    cycle_index=cycle_index,
+                ),
+            )
+
+        if (
+            self.config.activation_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            return cast(
+                PlanningState,
+                checkpoint(
+                    run_cycle,
+                    x_raw,
+                    z,
+                    y,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                ),
+            )
+        return run_cycle(x_raw, z, y)
+
     def forward_state_trajectory(
         self,
         x_raw: torch.Tensor,
@@ -111,14 +158,12 @@ class MambaAttentionHybrid(nn.Module):
 
         for cycle_index in range(self.M_max):
             previous_z, previous_y = z, y
-            next_z, next_y = self.planning_loop(
+            next_z, next_y = self._execute_cycle(
                 x_raw,
-                z,
-                y,
-                warmup=False,
-                task_names=task_names,
-                x_mask=x_mask,
-                cycle_index=cycle_index,
+                (z, y),
+                cycle_index,
+                task_names,
+                x_mask,
             )
             if self.training:
                 z, y = next_z, next_y
@@ -175,14 +220,12 @@ class MambaAttentionHybrid(nn.Module):
         states: list[PlanningState] = []
         predictions: list[torch.Tensor] = []
         for cycle_index in range(num_cycles):
-            z, y = self.planning_loop(
+            z, y = self._execute_cycle(
                 x_raw,
-                z,
-                y,
-                warmup=False,
-                task_names=task_names,
-                x_mask=x_mask,
-                cycle_index=cycle_index,
+                (z, y),
+                cycle_index,
+                task_names,
+                x_mask,
             )
             states.append((z, y))
             predictions.append(self.q_head.get_q_values(z, y))

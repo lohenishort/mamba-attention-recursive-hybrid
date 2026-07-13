@@ -122,11 +122,18 @@ class MazeReasoningModel(nn.Module):
             x_raw, task_names=["MAZE"] * x_raw.shape[0]
         )
         cycle_logits: list[torch.Tensor] = []
-        for state in states:
-            prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
-                x_raw, state
-            )
-            cycle_logits.append(self.printer(prefix, decoder_input_ids, prefix_mask))
+        with torch.no_grad():
+            for state in states[:-1]:
+                prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
+                    x_raw, state
+                )
+                cycle_logits.append(
+                    self.printer(prefix, decoder_input_ids, prefix_mask)
+                )
+        prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
+            x_raw, states[-1]
+        )
+        cycle_logits.append(self.printer(prefix, decoder_input_ids, prefix_mask))
         return cycle_logits, probabilities
 
     @torch.no_grad()

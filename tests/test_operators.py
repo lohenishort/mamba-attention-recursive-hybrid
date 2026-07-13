@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import torch
 import torch.nn as nn
 from mamba_hybrid.config import MambaHybridConfig
@@ -148,3 +150,41 @@ def test_non_causal_hybrid_block_is_sequence_reversal_equivariant() -> None:
     backwards = block(inputs.flip(1), causal=False).flip(1)
 
     assert torch.allclose(forwards, backwards, atol=1e-5)
+
+
+def test_hybrid_block_prefix_matches_full_output_and_gradients() -> None:
+    config = MambaHybridConfig(d_model=16, n_meta=2, l_ans=2, n_steps=1)
+    full_block = MambaAttentionHybridBlock(config).train()
+    prefix_block = deepcopy(full_block)
+    full_input = torch.randn(2, 7, 16, requires_grad=True)
+    prefix_input = full_input.detach().clone().requires_grad_(True)
+    valid_mask = torch.tensor(
+        [
+            [True, True, True, True, True, False, False],
+            [True, True, True, True, False, False, False],
+        ]
+    )
+
+    full_output = full_block(full_input, causal=False, valid_mask=valid_mask)
+    prefix_output = prefix_block(
+        prefix_input,
+        causal=False,
+        valid_mask=valid_mask,
+        output_prefix_length=config.n_meta,
+    )
+
+    assert prefix_output.shape == (2, config.n_meta, config.d_model)
+    assert torch.allclose(prefix_output, full_output[:, : config.n_meta], atol=1e-6)
+
+    full_output[:, : config.n_meta].square().sum().backward()
+    prefix_output.square().sum().backward()
+    assert full_input.grad is not None
+    assert prefix_input.grad is not None
+    assert torch.allclose(prefix_input.grad, full_input.grad, atol=1e-6)
+    for (full_name, full_parameter), (prefix_name, prefix_parameter) in zip(
+        full_block.named_parameters(), prefix_block.named_parameters()
+    ):
+        assert full_name == prefix_name
+        assert full_parameter.grad is not None
+        assert prefix_parameter.grad is not None
+        assert torch.allclose(prefix_parameter.grad, full_parameter.grad, atol=1e-6)

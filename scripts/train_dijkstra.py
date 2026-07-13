@@ -175,12 +175,18 @@ class DijkstraReasoningModel(nn.Module):
             x_raw, task_names=["DIJKSTRA"] * x_raw.shape[0]
         )
         cycle_logits: list[torch.Tensor] = []
-        for state in states:
-            prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
-                x_raw, state
-            )
-            logits = self.printer(prefix, decoder_input_ids, prefix_mask)
-            cycle_logits.append(constrain_parent_logits(logits, adjacency, source))
+        with torch.no_grad():
+            for state in states[:-1]:
+                prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
+                    x_raw, state
+                )
+                logits = self.printer(prefix, decoder_input_ids, prefix_mask)
+                cycle_logits.append(constrain_parent_logits(logits, adjacency, source))
+        prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
+            x_raw, states[-1]
+        )
+        logits = self.printer(prefix, decoder_input_ids, prefix_mask)
+        cycle_logits.append(constrain_parent_logits(logits, adjacency, source))
         return cycle_logits, probabilities
 
     @torch.no_grad()
@@ -195,8 +201,9 @@ class DijkstraReasoningModel(nn.Module):
         prefix, prefix_mask = self.reasoning_encoder.build_memory_prefix(
             x_raw, states[-1]
         )
-        decoder_input = torch.full(
-            (adjacency.shape[0], 1),
+        cache = self.printer.prefill(prefix, prefix_mask, capacity=self.num_nodes)
+        current = torch.full(
+            (adjacency.shape[0],),
             self.bos_token,
             dtype=torch.long,
             device=adjacency.device,
@@ -204,11 +211,11 @@ class DijkstraReasoningModel(nn.Module):
         legal = valid_parent_mask(adjacency, source)
         outputs: list[torch.Tensor] = []
         for node in range(self.num_nodes):
-            logits = self.printer(prefix, decoder_input, prefix_mask)[:, -1]
+            logits, cache = self.printer.decode_step(current, cache, position=node)
             logits = logits.masked_fill(~legal[:, node], torch.finfo(logits.dtype).min)
             next_token = logits.argmax(dim=-1)
             outputs.append(next_token)
-            decoder_input = torch.cat([decoder_input, next_token.unsqueeze(1)], dim=1)
+            current = next_token
         return torch.stack(outputs, dim=1), probabilities
 
 

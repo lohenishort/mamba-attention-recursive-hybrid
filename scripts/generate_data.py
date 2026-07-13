@@ -1,6 +1,8 @@
 import argparse
 import random
+from collections import deque
 from typing import List, Tuple
+
 import torch
 
 
@@ -36,14 +38,11 @@ def generate_maze(size: int) -> Tuple[List[List[int]], List[Tuple[int, int]]]:
         grid[0][0] = 0
         grid[size - 1][size - 1] = 0
 
-        queue = [[(0, 0)]]
-        bfs_visited = {(0, 0)}
-        path = []
+        queue = deque([(0, 0)])
+        parents: dict[Tuple[int, int], Tuple[int, int] | None] = {(0, 0): None}
         while queue:
-            curr_path = queue.pop(0)
-            cx, cy = curr_path[-1]
+            cx, cy = queue.popleft()
             if cx == size - 1 and cy == size - 1:
-                path = curr_path
                 break
             for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nx, ny = cx + dx, cy + dy
@@ -51,12 +50,19 @@ def generate_maze(size: int) -> Tuple[List[List[int]], List[Tuple[int, int]]]:
                     0 <= nx < size
                     and 0 <= ny < size
                     and grid[nx][ny] == 0
-                    and (nx, ny) not in bfs_visited
+                    and (nx, ny) not in parents
                 ):
-                    bfs_visited.add((nx, ny))
-                    queue.append(curr_path + [(nx, ny)])
+                    parents[(nx, ny)] = (cx, cy)
+                    queue.append((nx, ny))
 
-        if path:
+        goal = (size - 1, size - 1)
+        if goal in parents:
+            path = []
+            current: Tuple[int, int] | None = goal
+            while current is not None:
+                path.append(current)
+                current = parents[current]
+            path.reverse()
             return grid, path
 
 
