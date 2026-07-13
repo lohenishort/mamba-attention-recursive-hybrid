@@ -79,10 +79,10 @@ class MambaAttentionHybrid(nn.Module):
             z, y = self.planning_loop(x_raw, z, y, warmup=True, task_names=task_names)
         return z, y
 
-    def forward(
+    def forward_states(
         self, x_raw: torch.Tensor, task_names: List[str] | None = None
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Return vocabulary logits and per-step BCE halting probabilities."""
+        """Return latent answer states and per-step BCE halting probabilities."""
         z, y = self._initialize(x_raw, task_names)
         batch_size = x_raw.shape[0]
         active = torch.ones(batch_size, dtype=torch.bool, device=x_raw.device)
@@ -113,7 +113,14 @@ class MambaAttentionHybrid(nn.Module):
                 if not bool(active.any()):
                     break
 
-        return self.decode_answer(y), probabilities
+        return y, probabilities
+
+    def forward(
+        self, x_raw: torch.Tensor, task_names: List[str] | None = None
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Return vocabulary logits and per-step BCE halting probabilities."""
+        answer_states, probabilities = self.forward_states(x_raw, task_names)
+        return self.decode_answer(answer_states), probabilities
 
     def forward_q(
         self, x_raw: torch.Tensor, task_names: List[str] | None = None

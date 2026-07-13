@@ -137,6 +137,12 @@ class UnifiedReasoningLLM(nn.Module):
         # Learnable 1D positional embeddings for input context
         self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len, config.d_model))
         self.reasoning_encoder = MambaAttentionHybrid(config)
+        self.heads = nn.ModuleDict(
+            {
+                task: nn.Linear(config.d_model, vocab_size)
+                for task in ("MAZE", "SUDOKU", "DIJKSTRA", "GSM8K")
+            }
+        )
 
         if config.vocab_size != vocab_size:
             raise ValueError("config.vocab_size must match the multitask vocabulary")
@@ -148,10 +154,16 @@ class UnifiedReasoningLLM(nn.Module):
         X_raw = (
             self.embed(input_ids) + self.pos_embed[:, : input_ids.shape[1], :]
         )  # [B, L_raw, D]
-        output: Tuple[torch.Tensor, List[torch.Tensor]] = self.reasoning_encoder(
+        answer_states, probabilities = self.reasoning_encoder.forward_states(
             X_raw, task_names=task_names
         )
-        return output
+        logits = torch.stack(
+            [
+                self.heads[task](answer_states[index])
+                for index, task in enumerate(task_names)
+            ]
+        )
+        return logits, probabilities
 
 
 # --- 3. Main Training Driver ---
