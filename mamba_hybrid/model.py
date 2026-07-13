@@ -28,7 +28,7 @@ class MambaAttentionHybrid(nn.Module):
         self.M_meta = nn.Parameter(torch.randn(1, self.n_meta, self.d_model))
         self.y_pos_embed = nn.Parameter(torch.randn(1, self.l_ans, self.d_model))
         self.ans_init_proj = nn.Linear(self.d_model, self.d_model)
-        self.vocab_decoder = nn.Linear(self.d_model, config.vocab_size, bias=False)
+        self.vocab_decoder = nn.Linear(self.d_model, config.vocab_size)
         self.planning_loop = PlanningLoop(config)
         self.q_head = ACTHaltingModule(config)
 
