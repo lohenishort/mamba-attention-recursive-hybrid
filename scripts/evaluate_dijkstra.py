@@ -1,97 +1,58 @@
-import os
+"""Evaluate Dijkstra checkpoints with tie-tolerant shortest-path metrics."""
+
 import torch
-from typing import List
+from torch.utils.data import DataLoader, Subset
 
-from scripts.train_dijkstra import DijkstraReasoningModel, DijkstraDataset
-from scripts.utils import config_from_dict, load_validation_indices
-
-
-def print_routing_tree(parents: List[int], distances: List[float]) -> None:
-    """Prints the shortest path parent routing tree in a clean format."""
-    print("Node | Parent | Distance from Node 0")
-    print("-----+--------+---------------------")
-    for i in range(len(parents)):
-        parent_str = "Source" if parents[i] == i else f"Node {parents[i]}"
-        dist_str = (
-            f"{distances[i]:.2f}" if distances[i] != float("inf") else "Unreachable"
-        )
-        print(f"{i:4d} | {parent_str:6s} | {dist_str}")
+from mamba_hybrid.tasks.dijkstra import compute_dijkstra_metrics
+from scripts.train_dijkstra import DijkstraDataset, DijkstraReasoningModel
+from scripts.utils import config_from_dict, load_validation_indices, require_file
 
 
 def main() -> None:
-    model_path = "data/dijkstra_model.pt"
-    data_path = "data/dijkstra.pt"
-
-    if not os.path.exists(model_path) or not os.path.exists(data_path):
-        raise FileNotFoundError(
-            "Dijkstra checkpoint or dataset missing; train it first"
+    checkpoint_path = "data/dijkstra_model.pt"
+    require_file(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if checkpoint.get("schema_version") != 2 or checkpoint.get("task") != "dijkstra":
+        raise ValueError(
+            "legacy Dijkstra checkpoint is not compatible; retrain schema v2"
         )
-
-    device = torch.device(
-        "xpu"
-        if hasattr(torch, "xpu") and torch.xpu.is_available()
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    print(f"Loading Dijkstra Evaluation Environment on {device}...")
-
-    # Load checkpoint and config
-    checkpoint = torch.load(model_path, map_location=device)
-    config = config_from_dict(checkpoint["config"])
-    num_nodes = int(checkpoint["num_nodes"])
-
-    # Initialize model
-    model = DijkstraReasoningModel(config, vocab_size=int(checkpoint["vocab_size"])).to(
-        device
-    )
+    data_path = str(checkpoint["dataset"])
+    require_file(data_path)
+    samples = torch.load(data_path)
+    indices = load_validation_indices(checkpoint)
+    num_nodes = int(checkpoint["task_config"]["num_nodes"])
+    dataset = DijkstraDataset(samples, num_nodes=num_nodes)
+    loader = DataLoader(Subset(dataset, indices), batch_size=16, shuffle=False)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DijkstraReasoningModel(
+        config_from_dict(checkpoint["config"]), num_nodes=num_nodes
+    ).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
-    # Load dataset
-    all_samples = torch.load(data_path)
-    validation_indices = load_validation_indices(checkpoint)
-    dataset = DijkstraDataset(
-        all_samples, augment=False, num_nodes=num_nodes, d_model=config.d_model
+    predictions: list[torch.Tensor] = []
+    targets: list[torch.Tensor] = []
+    adjacencies: list[torch.Tensor] = []
+    distances: list[torch.Tensor] = []
+    sources: list[torch.Tensor] = []
+    for adjacency, source, target, distance in loader:
+        generated, _ = model.generate(adjacency.to(device), source.to(device))
+        predictions.append(generated.cpu())
+        targets.append(target)
+        adjacencies.append(adjacency)
+        distances.append(distance)
+        sources.append(source)
+    metrics = compute_dijkstra_metrics(
+        torch.cat(predictions),
+        torch.cat(targets),
+        torch.cat(adjacencies),
+        torch.cat(distances),
+        torch.cat(sources),
     )
-
-    # Run evaluation on the first sample
-    input_feats, target_ids = dataset[validation_indices[0]]
-
-    with torch.no_grad():
-        inp_batch = input_feats.unsqueeze(0).to(device)
-        logits, _ = model(inp_batch)
-        preds = logits.argmax(dim=-1).squeeze(0).tolist()
-
-    # Get raw sample to read the actual distances
-    raw_data = all_samples[validation_indices[0]]
-    distances = raw_data["distances"]
-
-    print("\n=== PREDICTED ROUTING TREE ===")
-    print_routing_tree(preds, distances)
-
-    print("\n=== GROUND TRUTH ROUTING TREE ===")
-    print_routing_tree(target_ids.tolist(), distances)
-
-    # Check accuracy
-    correct_nodes = sum(1 for p, t in zip(preds, target_ids.tolist()) if p == t)
-    print(
-        f"\nParent Node Prediction Accuracy: {correct_nodes}/20 ({correct_nodes / 20 * 100:.1f}%)"
-    )
-    node_correct = 0
-    graph_correct = 0
-    with torch.no_grad():
-        for index in validation_indices:
-            features, target = dataset[index]
-            prediction = (
-                model(features.unsqueeze(0).to(device))[0].argmax(-1).squeeze(0).cpu()
-            )
-            node_correct += int(prediction.eq(target).sum().item())
-            graph_correct += int(prediction.eq(target).all().item())
-    print(
-        f"Held-out node accuracy: {node_correct / (len(validation_indices) * num_nodes):.4f}"
-    )
-    print(
-        f"Held-out exact graph accuracy: {graph_correct / len(validation_indices):.4f}"
-    )
+    print(f"Node accuracy: {metrics.node_accuracy:.4f}")
+    print(f"Legal-parent rate: {metrics.legal_parent_rate:.4f}")
+    print(f"Optimal-parent rate: {metrics.optimal_parent_rate:.4f}")
+    print(f"Exact optimal-tree rate: {metrics.exact_tree_rate:.4f}")
 
 
 if __name__ == "__main__":

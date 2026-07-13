@@ -3,8 +3,8 @@ import json
 import torch
 from typing import List, Dict, Any
 
-from mamba_hybrid.config import MambaHybridConfig
 from scripts.train_sudoku import SudokuDataset, SudokuReasoningModel
+from scripts.utils import config_from_dict
 
 
 def main() -> None:
@@ -16,27 +16,11 @@ def main() -> None:
     # Load checkpoint
     print(f"Loading checkpoint from {checkpoint_path}...")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if checkpoint.get("schema_version") != 2 or checkpoint.get("task") != "sudoku":
+        raise ValueError("legacy Sudoku checkpoint is incompatible; retrain schema v2")
 
     # Recreate config
-    config_dict = checkpoint["config"]
-    # Handle optional config parameters to avoid constructor issues
-    clean_config_dict = {
-        k: v
-        for k, v in config_dict.items()
-        if k
-        in [
-            "d_model",
-            "n_meta",
-            "l_ans",
-            "n_steps",
-            "t_cycles",
-            "M_min",
-            "M_max",
-            "use_cuda_kernels",
-            "use_moe",
-        ]
-    }
-    config = MambaHybridConfig(**clean_config_dict)
+    config = config_from_dict(checkpoint["config"])
 
     # Initialize model
     model = SudokuReasoningModel(config, vocab_size=10)
@@ -56,6 +40,8 @@ def main() -> None:
 
     total_cells = 0
     correct_cells = 0
+    total_blank_cells = 0
+    correct_blank_cells = 0
     total_boards = 0
     correct_boards = 0
 
@@ -67,14 +53,21 @@ def main() -> None:
             logits, _ = model(puzzle_batch)
             preds = logits.argmax(dim=-1).squeeze(0)
 
-            cell_matches = (preds == solution).sum().item()
+            cell_matches = int((preds == solution).sum().item())
+            blank_mask = puzzle.eq(0)
+            blank_matches = int(preds[blank_mask].eq(solution[blank_mask]).sum().item())
             correct_cells += cell_matches
             total_cells += 81
+            correct_blank_cells += blank_matches
+            total_blank_cells += int(blank_mask.sum().item())
             total_boards += 1
             if cell_matches == 81:
                 correct_boards += 1
 
-            print(f"Board {i + 1:02d} | Correct cells: {cell_matches}/81")
+            print(
+                f"Board {i + 1:02d} | Correct cells: {cell_matches}/81 | "
+                f"Correct blanks: {blank_matches}/{int(blank_mask.sum().item())}"
+            )
             if i < 3:
                 print("Puzzle:   ", puzzle.tolist()[:27])
                 print("Predict:  ", preds.tolist()[:27])
@@ -84,6 +77,10 @@ def main() -> None:
     print("\nOverall Summary:")
     print(
         f"Per-cell Accuracy: {correct_cells / total_cells * 100:.2f}% ({correct_cells}/{total_cells})"
+    )
+    print(
+        f"Blank-cell Accuracy: {correct_blank_cells / total_blank_cells * 100:.2f}% "
+        f"({correct_blank_cells}/{total_blank_cells})"
     )
     print(
         f"Per-board Accuracy: {correct_boards / total_boards * 100:.2f}% ({correct_boards}/{total_boards})"

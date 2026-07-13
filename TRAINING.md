@@ -1,110 +1,92 @@
-# Training Guide: Mamba-Attention Recursive reasoning Hybrid
+# Training Guide
 
-This guide provides the instructions and commands to train and evaluate the four reasoning models (Sudoku, Maze, Dijkstra, and Unified Multitask) on the remote server or locally.
+All commands run from the repository root through `uv`. Install dependencies with:
 
----
+```bash
+uv sync
+```
 
-## 1. Setup & Environment
+Run only one GPU training process at a time on an 8 GB device.
 
-All commands should be executed from the root directory of the repository (`/srv/mamba-attention-recursive-hybrid` on the remote server). 
+## Architecture Semantics
 
-Install dependencies with `uv sync`. Run every Python command through `uv run`; do not invoke the project virtual environment directly.
+- One ACT decision is made after each complete planning cycle.
+- `M_min` and `M_max` count cycles, not latent micro-steps.
+- The task loss is applied only to the final cycle.
+- ACT targets are computed from each cycle's own decoded prediction.
+- Full-recursion backpropagation remains connected to `M_meta`, answer initialization, and input adapters.
+- Planning uses bidirectional attention and bidirectional SSD; printing remains causal.
+- The printer prefix is `[meta memory, answer memory, raw context]`.
+- Q-learning uses binary correctness rewards only. There is no handcrafted negative step reward.
 
----
+## Data
 
-## 2. Training the Models Separately
+Generate/download all datasets:
 
-To prevent GPU Out-Of-Memory (OOM) errors on the single **NVIDIA RTX A1000 (8 GB)** GPU, it is recommended to run training jobs **individually** (one at a time) or configure batch sizes carefully if running concurrently.
+```bash
+uv run python -m scripts.download_all_datasets
+```
 
-### A. Sudoku Solver Model
-Trains the model to solve 9x9 Sudoku boards using 2D row/column positional embeddings.
-* **Command (Background):**
-  ```bash
-  nohup uv run python -u -m scripts.train_sudoku > /srv/sudoku_train.log 2>&1 &
-  ```
-* **Command (Foreground):**
-  ```bash
-  uv run python -u -m scripts.train_sudoku
-  ```
-* **Logs & Progress:** `/srv/sudoku_train.log`
+Sudoku generation guarantees one solution. Dijkstra schema v2 stores an explicit source and distinguishes unreachable vertices. Maze targets are moves plus EOS. GSM8K targets contain only the normalized integer after `####`.
 
-### B. Maze Solver Model (30x30 Hard Maze)
-Trains the model on a 30x30 grid (sequence length 900) using 2D positional embeddings.
-To run this model on the RTX A1000 without OOM, the script uses a batch size of 4 and 8 gradient accumulation steps:
-* **Command (Background):**
-  ```bash
-  nohup uv run python -u -m scripts.train_maze_laptop > /srv/maze_train.log 2>&1 &
-  ```
-* **Command (Foreground):**
-  ```bash
-  uv run python -u -m scripts.train_maze_laptop
-  ```
-* **Logs & Progress:** `/srv/maze_train.log`
+## Standalone Training
 
-### C. Dijkstra Graph Routing Model
-Trains the model to find shortest path trees (SPT) on 20-node graphs using 1D positional embeddings.
-* **Command (Background):**
-  ```bash
-  nohup uv run python -u -m scripts.train_dijkstra > /srv/dijkstra_train.log 2>&1 &
-  ```
-* **Command (Foreground):**
-  ```bash
-  uv run python -u -m scripts.train_dijkstra
-  ```
-* **Logs & Progress:** `/srv/dijkstra_train.log`
+```bash
+uv run python -m scripts.train_sudoku
+uv run python -m scripts.train_maze
+uv run python -m scripts.train_maze_laptop
+uv run python -m scripts.train_dijkstra
+uv run python -m scripts.train_gsm8k
+```
 
-### D. Unified Multi-Task Model (MoE)
-Trains a generalist sequence-to-sequence model handling Maze, Sudoku, Dijkstra, and GSM8K (math reasoning) using task-prefixed expert routing.
-* **Run on GPU (Ensure other GPU training is stopped):**
-  ```bash
-  nohup uv run python -u -m scripts.train_multitask > /srv/multitask_train.log 2>&1 &
-  ```
-* **Run on CPU (Forces PyTorch to run on host CPU to prevent OOM):**
-  ```bash
-  export CUDA_VISIBLE_DEVICES=""
-  nohup uv run python -u -m scripts.train_multitask > /srv/multitask_train.log 2>&1 &
-  ```
-* **Logs & Progress:** `/srv/multitask_train.log`
+Task metrics:
 
----
+- Sudoku: blank-cell accuracy, valid/exact board rate.
+- Maze: legal goal-reaching solve rate and shortest-path solve rate.
+- Dijkstra: legal-parent rate, optimal-parent rate, exact optimal-tree rate.
+- GSM8K: normalized final-answer exact match on the official test split.
 
-## 3. Monitoring & Managing Background Jobs
+## Native Multitask Training
 
-* **Check running training processes:**
-  ```bash
-  ps aux | grep train_
-  ```
-* **Monitor progress in real-time:**
-  ```bash
-  tail -f /srv/sudoku_train.log
-  # or dijkstra_train.log, maze_train.log, multitask_train.log
-  ```
-* **Stop a training process:**
-  ```bash
-  kill -9 <PID>
-  # or kill all python training runs
-  pkill -9 -f train_
-  ```
+```bash
+uv run python -m scripts.train_multitask
+```
 
----
+The multitask trainer does not serialize grids or graphs as ASCII. It schedules homogeneous task batches in deterministic round-robin order. Task adapters and autoregressive printers are separate; the recursive MoE planner is shared.
 
-## 4. Model Evaluation & Diagnostics
+## Evaluation
 
-After training, you can evaluate model accuracy using the diagnostics and evaluation scripts:
+```bash
+uv run python -m scripts.evaluate_sudoku
+uv run python -m scripts.evaluate_maze
+uv run python -m scripts.evaluate_dijkstra
+uv run python -m scripts.evaluate_gsm8k
+uv run python -m scripts.evaluate_multitask
+```
 
-* **Evaluate Sudoku Checkpoint:**
-  ```bash
-  uv run python -m scripts.evaluate_sudoku
-  ```
-* **Evaluate Dijkstra Checkpoint:**
-  ```bash
-  uv run python -m scripts.evaluate_dijkstra
-  ```
-* **Evaluate Maze Checkpoint:**
-  ```bash
-  uv run python -m scripts.evaluate_maze
-  ```
-* **Evaluate Multitask Unified Checkpoint:**
-  ```bash
-  uv run python -m scripts.evaluate_multitask
-  ```
+Schema-v2 evaluators reject semantically incompatible legacy checkpoints instead of loading mismatched heads with `strict=False`.
+
+## Background Runs
+
+Use the project virtual environment selected by `uv` and preserve the PID:
+
+```bash
+nohup uv run python -u -m scripts.train_sudoku > data/train_sudoku.log 2>&1 &
+printf '%s\n' "$!" > data/train_sudoku.pid
+```
+
+Monitor and stop gracefully:
+
+```bash
+tail -f data/train_sudoku.log
+kill "$(cat data/train_sudoku.pid)"
+```
+
+## Verification
+
+```bash
+uv run ruff format .
+uv run ruff check .
+uv run mypy . --strict
+uv run pytest -v
+```

@@ -18,3 +18,25 @@ def test_bce_joint_loss() -> None:
         y_final, target_ids, bce_probs, correct_mask
     )
     assert loss > 0
+
+
+def test_bce_uses_per_cycle_targets_and_respects_minimum_cycles() -> None:
+    first_probability = torch.tensor([0.5], requires_grad=True)
+    second_probability = torch.tensor([0.5], requires_grad=True)
+    logits = torch.randn(1, 1, 3, requires_grad=True)
+    targets = torch.tensor([[1]])
+    cycle_correct = torch.tensor([[1.0], [1.0]])
+
+    loss = compute_bce_joint_loss(
+        logits,
+        targets,
+        [first_probability, second_probability],
+        cycle_correct,
+        min_cycles=2,
+    )
+    loss.backward()  # type: ignore[no-untyped-call]
+
+    assert first_probability.grad is not None
+    assert second_probability.grad is not None
+    assert first_probability.grad.item() > 0  # halt forbidden before M_min
+    assert second_probability.grad.item() < 0  # correct answer should halt

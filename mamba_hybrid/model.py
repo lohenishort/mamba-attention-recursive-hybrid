@@ -3,17 +3,16 @@ from typing import List, cast
 import torch
 import torch.nn as nn
 
-from mamba_hybrid.answer_update import AnswerUpdateBlock
 from mamba_hybrid.config import MambaHybridConfig
 from mamba_hybrid.halting import ACTHaltingModule
 from mamba_hybrid.planning import PlanningLoop
 
-
 SUPPORTED_TASKS = frozenset({"MAZE", "SUDOKU", "DIJKSTRA", "GSM8K"})
+PlanningState = tuple[torch.Tensor, torch.Tensor]
 
 
 class MambaAttentionHybrid(nn.Module):
-    """Recursive latent planner with explicit answer decoding and ACT heads."""
+    """Recursive planner with cycle-level adaptive computation."""
 
     def __init__(self, config: MambaHybridConfig) -> None:
         super().__init__()
@@ -41,106 +40,150 @@ class MambaAttentionHybrid(nn.Module):
         if unknown:
             raise ValueError(f"unknown task_names: {sorted(unknown)}")
 
-    def init_answer(self, x_raw: torch.Tensor) -> torch.Tensor:
-        """Initialize latent answer states from pooled input. [B, L_ans, D]."""
-        pooled = x_raw.mean(dim=1)  # [batch_size, d_model]
+    def init_answer(
+        self, x_raw: torch.Tensor, x_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Initialize aligned slots directly and pool unaligned inputs. [B,L_ans,D]."""
+        if x_raw.shape[1] == self.l_ans:
+            return cast(torch.Tensor, self.ans_init_proj(x_raw) + self.y_pos_embed)
+        if x_mask is None:
+            pooled = x_raw.mean(dim=1)
+        else:
+            if x_mask.shape != x_raw.shape[:2]:
+                raise ValueError("x_mask must match the first two x_raw dimensions")
+            weights = x_mask.to(device=x_raw.device, dtype=x_raw.dtype).unsqueeze(-1)
+            pooled = (x_raw * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
         answer = self.ans_init_proj(pooled).unsqueeze(1).expand(-1, self.l_ans, -1)
         return cast(torch.Tensor, answer + self.y_pos_embed)
 
     def decode_answer(self, answer_states: torch.Tensor) -> torch.Tensor:
-        """Project latent answer states to vocabulary logits. [B, L_ans, V]."""
+        """Project latent answer memory to compatibility logits. [B,L_ans,V]."""
         return cast(torch.Tensor, self.vocab_decoder(answer_states))
 
-    def _update_answer(
-        self, z: torch.Tensor, y: torch.Tensor, task_names: List[str] | None
-    ) -> torch.Tensor:
-        blocks = self.planning_loop.answer_update_blocks
-        if self.config.use_moe and blocks is not None:
-            names = task_names if task_names is not None else ["MAZE"] * y.shape[0]
-            outputs: list[torch.Tensor] = []
-            for index, task in enumerate(names):
-                task_block = blocks[task]
-                assert isinstance(task_block, AnswerUpdateBlock)
-                outputs.append(task_block(z[index : index + 1], y[index : index + 1]))
-            return torch.cat(outputs, dim=0)
-        answer_block = self.planning_loop.answer_update_block
-        if answer_block is None:
-            return y
-        return cast(torch.Tensor, answer_block(z, y))
+    def build_memory_prefix(
+        self,
+        x_raw: torch.Tensor,
+        state: PlanningState,
+        x_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build printer memory as [meta, answer, raw context] and its mask."""
+        z, y = state
+        prefix = torch.cat([z, y, x_raw], dim=1)
+        prefix_mask = torch.ones(
+            x_raw.shape[0],
+            z.shape[1] + y.shape[1],
+            dtype=torch.bool,
+            device=x_raw.device,
+        )
+        raw_mask = (
+            torch.ones(x_raw.shape[:2], dtype=torch.bool, device=x_raw.device)
+            if x_mask is None
+            else x_mask.to(device=x_raw.device, dtype=torch.bool)
+        )
+        return prefix, torch.cat([prefix_mask, raw_mask], dim=1)
 
     def _initialize(
-        self, x_raw: torch.Tensor, task_names: List[str] | None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        x_raw: torch.Tensor,
+        task_names: List[str] | None,
+        x_mask: torch.Tensor | None,
+    ) -> PlanningState:
         batch_size = x_raw.shape[0]
         self._validate_tasks(task_names, batch_size)
+        if x_mask is not None and x_mask.shape != x_raw.shape[:2]:
+            raise ValueError("x_mask must match the first two x_raw dimensions")
         z = self.M_meta.expand(batch_size, -1, -1)
-        y = self.init_answer(x_raw)
-        for _ in range(1, self.t_cycles):
-            z, y = self.planning_loop(x_raw, z, y, warmup=True, task_names=task_names)
+        y = self.init_answer(x_raw, x_mask)
         return z, y
 
-    def forward_states(
-        self, x_raw: torch.Tensor, task_names: List[str] | None = None
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Return latent answer states and per-step BCE halting probabilities."""
-        z, y = self._initialize(x_raw, task_names)
+    def forward_state_trajectory(
+        self,
+        x_raw: torch.Tensor,
+        task_names: List[str] | None = None,
+        x_mask: torch.Tensor | None = None,
+    ) -> tuple[list[PlanningState], list[torch.Tensor]]:
+        """Return one planning state and halt probability per completed cycle."""
+        z, y = self._initialize(x_raw, task_names, x_mask)
         batch_size = x_raw.shape[0]
         active = torch.ones(batch_size, dtype=torch.bool, device=x_raw.device)
+        states: list[PlanningState] = []
         probabilities: list[torch.Tensor] = []
-        max_steps = self.n_steps if self.training else self.M_max
 
-        for step in range(1, max_steps + 1):
+        for cycle_index in range(self.M_max):
             previous_z, previous_y = z, y
-            x_concat = torch.cat([z, y, x_raw], dim=1)
-            next_z = self.planning_loop.planning_block(
-                x_concat, causal=False, task_names=task_names
-            )[:, : self.n_meta, :]
-            if self.training and torch.rand(1).item() < 0.15:
-                next_z = (
-                    next_z + torch.randn_like(next_z) * torch.rand(1).item() * 0.025
-                )
-            next_y = self._update_answer(next_z, y, task_names)
+            next_z, next_y = self.planning_loop(
+                x_raw,
+                z,
+                y,
+                warmup=False,
+                task_names=task_names,
+                x_mask=x_mask,
+                cycle_index=cycle_index,
+            )
             if self.training:
                 z, y = next_z, next_y
             else:
-                mask = active[:, None, None]
-                z = torch.where(mask, next_z, previous_z)
-                y = torch.where(mask, next_y, previous_y)
+                state_mask = active[:, None, None]
+                z = torch.where(state_mask, next_z, previous_z)
+                y = torch.where(state_mask, next_y, previous_y)
             probability = self.q_head(z, y)
+            states.append((z, y))
             probabilities.append(probability)
-            if not self.training and step >= self.M_min:
+            cycle = cycle_index + 1
+            if not self.training and cycle >= self.M_min:
                 active = active & (probability < self.config.halt_threshold)
                 if not bool(active.any()):
                     break
+        return states, probabilities
 
-        return y, probabilities
+    def forward_states(
+        self,
+        x_raw: torch.Tensor,
+        task_names: List[str] | None = None,
+        x_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Return final answer memory and per-cycle halt probabilities."""
+        states, probabilities = self.forward_state_trajectory(x_raw, task_names, x_mask)
+        return states[-1][1], probabilities
 
     def forward(
-        self, x_raw: torch.Tensor, task_names: List[str] | None = None
+        self,
+        x_raw: torch.Tensor,
+        task_names: List[str] | None = None,
+        x_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Return vocabulary logits and per-step BCE halting probabilities."""
-        answer_states, probabilities = self.forward_states(x_raw, task_names)
+        """Return compatibility logits and per-cycle halt probabilities."""
+        answer_states, probabilities = self.forward_states(x_raw, task_names, x_mask)
         return self.decode_answer(answer_states), probabilities
 
     def forward_q(
-        self, x_raw: torch.Tensor, task_names: List[str] | None = None
-    ) -> tuple[
-        torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]], list[torch.Tensor]
-    ]:
-        """Return logits and the exact state/Q trajectory used by Q-learning."""
-        z, y = self._initialize(x_raw, task_names)
+        self,
+        x_raw: torch.Tensor,
+        task_names: List[str] | None = None,
+        x_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[PlanningState], list[torch.Tensor]]:
+        """Return final logits and a cycle-level state/Q trajectory."""
+        z, y = self._initialize(x_raw, task_names, x_mask)
         if self.training:
-            num_steps = int(torch.randint(self.M_min, self.M_max + 1, (1,)).item())
+            num_cycles = int(
+                torch.randint(
+                    self.M_min, self.M_max + 1, (1,), device=x_raw.device
+                ).item()
+            )
         else:
-            num_steps = self.M_max
-        states: list[tuple[torch.Tensor, torch.Tensor]] = []
+            num_cycles = self.M_max
+        states: list[PlanningState] = []
         predictions: list[torch.Tensor] = []
-        for _ in range(num_steps):
-            x_concat = torch.cat([z, y, x_raw], dim=1)
-            z = self.planning_loop.planning_block(
-                x_concat, causal=False, task_names=task_names
-            )[:, : self.n_meta, :]
-            y = self._update_answer(z, y, task_names)
+        for cycle_index in range(num_cycles):
+            z, y = self.planning_loop(
+                x_raw,
+                z,
+                y,
+                warmup=False,
+                task_names=task_names,
+                x_mask=x_mask,
+                cycle_index=cycle_index,
+            )
             states.append((z, y))
             predictions.append(self.q_head.get_q_values(z, y))
         return self.decode_answer(y), states, predictions

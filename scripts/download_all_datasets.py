@@ -3,9 +3,12 @@ import urllib.request
 import json
 import random
 import heapq
-from typing import List, Tuple, Dict, Any
+from typing import Dict, Any
 import torch
 from scripts.generate_data import generate_maze
+from scripts.generate_massive_sudoku import (
+    generate_sudoku_board as _generate_sudoku_board,
+)
 
 
 def download_file(url: str, dest: str) -> None:
@@ -32,27 +35,9 @@ def build_maze_dataset(dest: str, size: int = 30, num_samples: int = 1000) -> No
 
 
 # --- 2. Sudoku Generator ---
-def pattern(r: int, c: int) -> int:
-    return (3 * (r % 3) + r // 3 + c) % 9
-
-
-def shuffle(s: List[int]) -> List[int]:
-    return random.sample(s, len(s))
-
-
-def generate_sudoku_board() -> Tuple[List[List[int]], List[List[int]]]:
-    r_base = range(3)
-    rows = [g * 3 + r for g in shuffle(list(r_base)) for r in shuffle(list(r_base))]
-    cols = [g * 3 + c for g in shuffle(list(r_base)) for c in shuffle(list(r_base))]
-    nums = shuffle(list(range(1, 10)))
-
-    board = [[nums[pattern(r, c)] for c in cols] for r in rows]
-    puzzle = [row[:] for row in board]
-    for r in range(9):
-        for c in range(9):
-            if random.random() < 0.5:  # remove 50% of the numbers
-                puzzle[r][c] = 0
-    return puzzle, board
+def generate_sudoku_board() -> tuple[list[list[int]], list[list[int]]]:
+    """Generate a uniquely solvable Sudoku puzzle and its solution."""
+    return _generate_sudoku_board()
 
 
 def build_sudoku_dataset(dest: str, num_samples: int = 1000) -> None:
@@ -70,8 +55,11 @@ def build_sudoku_dataset(dest: str, num_samples: int = 1000) -> None:
 
 # --- 3. Dijkstra Graph Generator (CLRS proxy) ---
 def generate_dijkstra_graph(
-    num_nodes: int = 20, edge_prob: float = 0.3
+    num_nodes: int = 20, edge_prob: float = 0.3, source: int | None = None
 ) -> Dict[str, Any]:
+    source = random.randrange(num_nodes) if source is None else source
+    if not 0 <= source < num_nodes:
+        raise ValueError("source must be a valid node index")
     adj = [[0.0] * num_nodes for _ in range(num_nodes)]
     for i in range(num_nodes):
         for j in range(i + 1, num_nodes):
@@ -81,8 +69,8 @@ def generate_dijkstra_graph(
                 adj[j][i] = weight
 
     dist = [float("inf")] * num_nodes
-    dist[0] = 0.0
-    pq = [(0.0, 0)]
+    dist[source] = 0.0
+    pq = [(0.0, source)]
     parent = [-1] * num_nodes
 
     while pq:
@@ -97,7 +85,13 @@ def generate_dijkstra_graph(
                     parent[v] = u
                     heapq.heappush(pq, (dist[v], v))
 
-    return {"adjacency": adj, "distances": dist, "parents": parent}
+    return {
+        "schema_version": 2,
+        "adjacency": adj,
+        "distances": dist,
+        "parents": parent,
+        "source": source,
+    }
 
 
 def build_dijkstra_dataset(dest: str, num_samples: int = 1000) -> None:

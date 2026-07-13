@@ -31,6 +31,8 @@ class PrefixCausalAttention(nn.Module):
         k: torch.Tensor,  # [B, num_heads, L, d_head]
         v: torch.Tensor,  # [B, num_heads, L, d_head]
         causal: bool = False,
+        valid_mask: torch.Tensor | None = None,  # [B, L]
+        prefix_length: int | None = None,
     ) -> torch.Tensor:  # [B, L, d_model]
         """
         Forward pass for prefix-causal attention.
@@ -50,22 +52,33 @@ class PrefixCausalAttention(nn.Module):
         # scores shape: [B, num_heads, L, L]
         scores: torch.Tensor = torch.matmul(q, k.transpose(-2, -1)) / (d_head**0.5)
 
+        if valid_mask is not None:
+            if valid_mask.shape != (B, L):
+                raise ValueError("valid_mask must have shape [batch_size, seq_len]")
+            scores = scores.masked_fill(
+                ~valid_mask[:, None, None, :].to(device=q.device, dtype=torch.bool),
+                float("-inf"),
+            )
+
         if causal:
+            prefix = self.n_meta if prefix_length is None else prefix_length
+            if not 0 <= prefix <= L:
+                raise ValueError("prefix_length must be between 0 and seq_len")
             # Initialize mask to zero (no attention allowed by default)
             mask: torch.Tensor = torch.zeros(L, L, device=q.device)
 
             # Effective meta-token count (in case sequence length is smaller than n_meta)
-            eff_n_meta: int = min(self.n_meta, L)
+            eff_n_meta: int = min(prefix, L)
 
             # 1. Meta-tokens can attend to all meta-tokens bidirectionally
             mask[:eff_n_meta, :eff_n_meta] = 1.0
 
-            if L > self.n_meta:
+            if L > prefix:
                 # 2. Subsequent tokens can attend to all meta-tokens
-                mask[self.n_meta :, : self.n_meta] = 1.0
+                mask[prefix:, :prefix] = 1.0
                 # 3. Subsequent tokens can attend to themselves and prior subsequent tokens causally
-                mask[self.n_meta :, self.n_meta :] = torch.tril(
-                    torch.ones(L - self.n_meta, L - self.n_meta, device=q.device)
+                mask[prefix:, prefix:] = torch.tril(
+                    torch.ones(L - prefix, L - prefix, device=q.device)
                 )
 
             # Apply mask: fill 0s with -inf to prevent attention

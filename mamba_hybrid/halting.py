@@ -41,12 +41,8 @@ class ACTHaltingModule(nn.Module):
         # z: [batch_size, seq_len_z, d_model]
         # y: [batch_size, seq_len_y, d_model]
 
-        # Concatenate along the sequence dimension: [batch_size, seq_len_z + seq_len_y, d_model]
-        concat_state = torch.cat([z, y], dim=1)
-
-        # Global average pooling over the sequence dimension: [batch_size, d_model]
-        # Detach to prevent gradients from flowing back into representations z and y
-        s_t = concat_state.mean(dim=1).detach()
+        # Equal weighting prevents the longer state sequence from dominating ACT.
+        s_t = ((z.mean(dim=1) + y.mean(dim=1)) * 0.5).detach()
 
         # Pass through MLP: [batch_size, 2]
         res = self.q_mlp(s_t)
@@ -66,12 +62,8 @@ class ACTHaltingModule(nn.Module):
         # z: [batch_size, seq_len_z, d_model]
         # y: [batch_size, seq_len_y, d_model]
 
-        # Concatenate along the sequence dimension: [batch_size, seq_len_z + seq_len_y, d_model]
-        concat_state = torch.cat([z, y], dim=1)
-
-        # Global average pooling over the sequence dimension: [batch_size, d_model]
-        # Detach to prevent gradients from flowing back into representations z and y
-        s_t = concat_state.mean(dim=1).detach()
+        # Equal weighting prevents the longer state sequence from dominating ACT.
+        s_t = ((z.mean(dim=1) + y.mean(dim=1)) * 0.5).detach()
 
         # Pass through MLP: [batch_size, 1] -> [batch_size]
         bce_logit = self.bce_mlp(s_t).squeeze(-1)

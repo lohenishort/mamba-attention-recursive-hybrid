@@ -37,6 +37,8 @@ def main() -> None:
 
     # Load checkpoint and config
     checkpoint = torch.load(model_path, map_location=device)
+    if checkpoint.get("schema_version") != 2 or checkpoint.get("task") != "sudoku":
+        raise ValueError("legacy Sudoku checkpoint is incompatible; retrain schema v2")
     config = config_from_dict(checkpoint["config"])
 
     # Initialize model

@@ -1,307 +1,318 @@
-import os
+"""Task-native multitask training with homogeneous batches and one shared planner."""
+
 import json
+import os
+from collections.abc import Iterator, Mapping
+from itertools import zip_longest
+from typing import Any, Literal, cast
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from typing import List, Tuple
+from torch.utils.data import DataLoader
 
 from mamba_hybrid.config import MambaHybridConfig
-from mamba_hybrid.model import MambaAttentionHybrid
 from mamba_hybrid.loss import compute_bce_joint_loss
-from scripts.utils import deterministic_split_indices, exact_match, seed_everything
+from mamba_hybrid.model import MambaAttentionHybrid
+from mamba_hybrid.tasks.common import shift_targets_right
+from mamba_hybrid.tasks.dijkstra import dijkstra_correct_mask
+from mamba_hybrid.tasks.gsm8k import VOCAB_SIZE as BYTE_VOCAB_SIZE
+from mamba_hybrid.tasks.maze import PAD as MAZE_PAD
+from mamba_hybrid.tasks.maze import maze_correct_mask
+from scripts.train_dijkstra import DijkstraDataset, DijkstraReasoningModel
+from scripts.train_gsm8k import (
+    GSM8KDataset,
+    GSM8KReasoningModel,
+    collate_gsm8k,
+)
+from scripts.train_maze import MazeDataset, MazeReasoningModel
+from scripts.train_sudoku import (
+    SudokuDataset,
+    SudokuReasoningModel,
+    sudoku_completion_targets,
+)
+from scripts.utils import seed_everything
+
+TaskName = Literal["SUDOKU", "DIJKSTRA", "MAZE", "GSM8K"]
+TaskBatch = Any
 
 
-def tokenize_string(
-    s: str, max_len: int, *, allow_truncation: bool = False
-) -> List[int]:
-    """Converts a string to a list of ASCII token IDs, padded to max_len."""
-    tokens = []
-    for c in s:
-        val = ord(c)
-        if val > 127:
-            val = 63  # ASCII for '?'
-        tokens.append(val)
-    if len(tokens) < max_len:
-        tokens += [0] * (max_len - len(tokens))
-    elif allow_truncation:
-        tokens = tokens[:max_len]
-    else:
-        raise ValueError(
-            f"Encoded text length {len(tokens)} exceeds configured limit {max_len}"
-        )
-    return tokens
+class NativeMultiTaskModel(nn.Module):
+    """Route task-native adapters and printers through one MoE planning core."""
 
-
-# --- 1. Multi-Task Dataset Loader ---
-class MultiTaskDataset(Dataset[Tuple[torch.Tensor, torch.Tensor, str]]):
     def __init__(
         self,
-        data_dir: str,
-        max_seq_len: int = 128,
-        l_ans: int = 128,
-        max_samples_per_task: int = 100,
-        required_tasks: Tuple[str, ...] = ("MAZE", "SUDOKU", "DIJKSTRA", "GSM8K"),
-    ) -> None:
-        self.samples: List[Tuple[str, str, str]] = []
-        self.max_seq_len = max_seq_len
-        self.l_ans = l_ans
-        loaded_tasks: set[str] = set()
-
-        def add_sample(inp: str, tgt: str, task: str) -> None:
-            if len(inp) <= self.max_seq_len and len(tgt) <= self.l_ans:
-                self.samples.append((inp, tgt, task))
-                loaded_tasks.add(task)
-
-        # 1. Maze
-        maze_path = os.path.join(data_dir, "maze_dryrun.pt")
-        if os.path.exists(maze_path):
-            maze_data = torch.load(maze_path)[:max_samples_per_task]
-            for s in maze_data:
-                grid_str = "".join(str(int(val)) for row in s["grid"] for val in row)
-                inp = f"MAZE: {grid_str}"
-                tgt = "PATH: " + " ".join(f"({r},{c})" for r, c in s["path"])
-                add_sample(inp, tgt, "MAZE")
-
-        # 2. Sudoku
-        sudoku_path = os.path.join(data_dir, "sudoku.jsonl")
-        if os.path.exists(sudoku_path):
-            count = 0
-            with open(sudoku_path, "r") as f:
-                for line in f:
-                    s = json.loads(line)
-                    grid_str = "".join(str(val) for row in s["puzzle"] for val in row)
-                    inp = f"SUDOKU: {grid_str}"
-                    sol_str = "".join(str(val) for row in s["solution"] for val in row)
-                    tgt = f"SOL: {sol_str}"
-                    add_sample(inp, tgt, "SUDOKU")
-                    count += 1
-                    if count >= max_samples_per_task:
-                        break
-
-        # 3. Dijkstra Graphs
-        dijkstra_path = os.path.join(data_dir, "dijkstra.pt")
-        if os.path.exists(dijkstra_path):
-            dijkstra_data = torch.load(dijkstra_path)[:max_samples_per_task]
-            for s in dijkstra_data:
-                adj = s["adjacency"]
-                edges = []
-                for i in range(len(adj)):
-                    for j in range(len(adj)):
-                        if adj[i][j] > 0:
-                            edges.append(f"{i}->{j}:{adj[i][j]:.1f}")
-                inp = "DIJKSTRA: " + ",".join(edges)
-                tgt = "DIST: " + " ".join(f"{d:.1f}" for d in s["distances"])
-                add_sample(inp, tgt, "DIJKSTRA")
-
-        # 4. GSM8K
-        gsm8k_path = os.path.join(data_dir, "gsm8k_train.jsonl")
-        if os.path.exists(gsm8k_path):
-            count = 0
-            with open(gsm8k_path, "r") as f:
-                for line in f:
-                    s = json.loads(line)
-                    inp = f"GSM8K: {s['question']}"
-                    tgt = f"ANS: {s['answer']}"
-                    add_sample(inp, tgt, "GSM8K")
-                    count += 1
-                    if count >= max_samples_per_task:
-                        break
-        missing = set(required_tasks) - loaded_tasks
-        if missing:
-            raise FileNotFoundError(
-                f"Missing required multitask datasets: {', '.join(sorted(missing))}"
-            )
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
-        inp_str, tgt_str, task_name = self.samples[idx]
-        inp_tokens = tokenize_string(inp_str, self.max_seq_len)
-        tgt_tokens = tokenize_string(tgt_str, self.l_ans)
-        return (
-            torch.tensor(inp_tokens, dtype=torch.long),
-            torch.tensor(tgt_tokens, dtype=torch.long),
-            task_name,
-        )
-
-
-# --- 2. Unified Reasoning LLM Model with Task-Specific Heads ---
-class UnifiedReasoningLLM(nn.Module):
-    def __init__(
-        self, config: MambaHybridConfig, vocab_size: int = 128, max_seq_len: int = 128
+        config: MambaHybridConfig,
+        *,
+        grid_size: int = 10,
+        num_nodes: int = 20,
+        max_question_bytes: int = 1024,
+        max_gsm_answer_length: int = 16,
     ) -> None:
         super().__init__()
-        self.config = config
-        self.embed = nn.Embedding(vocab_size, config.d_model)
-        # Learnable 1D positional embeddings for input context
-        self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len, config.d_model))
+        if not config.use_moe:
+            raise ValueError("native multitask training requires use_moe=True")
         self.reasoning_encoder = MambaAttentionHybrid(config)
-        self.heads = nn.ModuleDict(
-            {
-                task: nn.Linear(config.d_model, vocab_size)
-                for task in ("MAZE", "SUDOKU", "DIJKSTRA", "GSM8K")
-            }
+        self.sudoku = SudokuReasoningModel(
+            config, reasoning_encoder=self.reasoning_encoder
+        )
+        self.dijkstra = DijkstraReasoningModel(
+            config, num_nodes=num_nodes, reasoning_encoder=self.reasoning_encoder
+        )
+        self.maze = MazeReasoningModel(
+            config, grid_size=grid_size, reasoning_encoder=self.reasoning_encoder
+        )
+        self.gsm8k = GSM8KReasoningModel(
+            config,
+            max_question_bytes=max_question_bytes,
+            max_answer_length=max_gsm_answer_length,
+            reasoning_encoder=self.reasoning_encoder,
         )
 
-        if config.vocab_size != vocab_size:
-            raise ValueError("config.vocab_size must match the multitask vocabulary")
+    def forward_task(
+        self, task_name: TaskName, batch: Mapping[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Run one homogeneous task batch through its native adapter and printer."""
+        if task_name == "SUDOKU":
+            return cast(
+                tuple[torch.Tensor, list[torch.Tensor]],
+                self.sudoku(batch["input_ids"], batch["decoder_input_ids"]),
+            )
+        if task_name == "DIJKSTRA":
+            return cast(
+                tuple[torch.Tensor, list[torch.Tensor]],
+                self.dijkstra(
+                    batch["adjacency"], batch["source"], batch["decoder_input_ids"]
+                ),
+            )
+        if task_name == "MAZE":
+            return cast(
+                tuple[torch.Tensor, list[torch.Tensor]],
+                self.maze(batch["grid"], batch["decoder_input_ids"]),
+            )
+        if task_name == "GSM8K":
+            return cast(
+                tuple[torch.Tensor, list[torch.Tensor]],
+                self.gsm8k(
+                    batch["question_ids"],
+                    batch["question_mask"],
+                    batch["decoder_input_ids"],
+                ),
+            )
+        raise ValueError(f"unsupported task: {task_name}")
 
-    def forward(
-        self, input_ids: torch.Tensor, task_names: List[str]
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        # input_ids shape: [B, L_raw]
-        X_raw = (
-            self.embed(input_ids) + self.pos_embed[:, : input_ids.shape[1], :]
-        )  # [B, L_raw, D]
-        answer_states, probabilities = self.reasoning_encoder.forward_states(
-            X_raw, task_names=task_names
+
+def round_robin_batches(
+    loaders: Mapping[TaskName, DataLoader[Any]],
+) -> Iterator[tuple[TaskName, TaskBatch]]:
+    """Yield one homogeneous batch per task in deterministic round-robin order."""
+    names = list(loaders)
+    iterators = [iter(loaders[name]) for name in names]
+    for row in zip_longest(*iterators):
+        for name, batch in zip(names, row):
+            if batch is not None:
+                yield name, batch
+
+
+def _sequence_correct(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    mask = targets.ne(-100)
+    return (logits.argmax(dim=-1).eq(targets) | ~mask).all(dim=-1)
+
+
+def native_task_loss(
+    model: NativeMultiTaskModel,
+    task_name: TaskName,
+    batch: TaskBatch,
+    device: torch.device,
+) -> tuple[torch.Tensor, float]:
+    """Compute final-step task CE plus per-cycle binary ACT supervision."""
+    if task_name == "SUDOKU":
+        input_ids, targets = (tensor.to(device) for tensor in batch)
+        decoder_inputs = shift_targets_right(
+            targets,
+            bos_token_id=model.sudoku.bos_token,
+            pad_token_id=model.sudoku.pad_token,
         )
-        logits = torch.stack(
+        cycle_logits, probabilities = model.sudoku.forward_cycle_logits(
+            input_ids, decoder_inputs
+        )
+        cycle_correct = torch.stack(
+            [logits.argmax(dim=-1).eq(targets).all(dim=-1) for logits in cycle_logits]
+        )
+        loss_targets = sudoku_completion_targets(input_ids, targets)
+        ignore_index = -100
+    elif task_name == "DIJKSTRA":
+        adjacency, source, targets, distances = (tensor.to(device) for tensor in batch)
+        decoder_inputs = shift_targets_right(
+            targets,
+            bos_token_id=model.dijkstra.bos_token,
+            pad_token_id=model.dijkstra.num_nodes,
+        )
+        cycle_logits, probabilities = model.dijkstra.forward_cycle_logits(
+            adjacency, source, decoder_inputs
+        )
+        cycle_correct = torch.stack(
             [
-                self.heads[task](answer_states[index])
-                for index, task in enumerate(task_names)
+                dijkstra_correct_mask(
+                    logits.argmax(dim=-1), adjacency, distances, source
+                )
+                for logits in cycle_logits
             ]
         )
-        return logits, probabilities
+        loss_targets = targets
+        ignore_index = -100
+    elif task_name == "MAZE":
+        grids, targets = (tensor.to(device) for tensor in batch)
+        decoder_inputs = shift_targets_right(
+            targets,
+            bos_token_id=model.maze.bos_token,
+            pad_token_id=MAZE_PAD,
+        )
+        cycle_logits, probabilities = model.maze.forward_cycle_logits(
+            grids, decoder_inputs
+        )
+        size = model.maze.grid_size
+        cycle_correct = torch.stack(
+            [
+                maze_correct_mask(logits.argmax(dim=-1), grids.view(-1, size, size))
+                for logits in cycle_logits
+            ]
+        )
+        loss_targets = targets
+        ignore_index = MAZE_PAD
+    else:
+        questions, question_mask, decoder_inputs, targets = (
+            tensor.to(device) for tensor in batch
+        )
+        cycle_logits, probabilities = model.gsm8k.forward_cycle_logits(
+            questions, question_mask, decoder_inputs
+        )
+        cycle_correct = torch.stack(
+            [_sequence_correct(logits, targets) for logits in cycle_logits]
+        )
+        loss_targets = targets
+        ignore_index = -100
+
+    loss = compute_bce_joint_loss(
+        cycle_logits[-1],
+        loss_targets,
+        probabilities,
+        cycle_correct.float(),
+        alpha=1.0,
+        ignore_index=ignore_index,
+        min_cycles=model.reasoning_encoder.config.M_min,
+    )
+    return loss, float(cycle_correct[-1].float().mean().item())
 
 
-# --- 3. Main Training Driver ---
 def main() -> None:
-    data_dir = "data"
-
+    required = [
+        "data/sudoku.jsonl",
+        "data/dijkstra.pt",
+        "data/maze_dryrun.pt",
+        "data/gsm8k_train.jsonl",
+    ]
+    missing = [path for path in required if not os.path.exists(path)]
+    if missing:
+        raise FileNotFoundError(f"missing multitask datasets: {', '.join(missing)}")
     device = torch.device(
         "xpu"
         if hasattr(torch, "xpu") and torch.xpu.is_available()
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    print(f"Using device: {device}")
+    seed_everything(42)
 
-    # Set up config with max answer length (128 for GSM8K)
-    l_ans = 128
-    max_seq_len = 2048
+    with open("data/sudoku.jsonl") as sudoku_file:
+        sudoku_samples = [json.loads(line) for _, line in zip(range(1000), sudoku_file)]
+    dijkstra_samples: list[dict[str, Any]] = torch.load("data/dijkstra.pt")[:1000]
+    maze_samples: list[dict[str, Any]] = torch.load("data/maze_dryrun.pt")
+    grid_size = len(maze_samples[0]["grid"])
+    maze_length = max(len(sample["path"]) for sample in maze_samples)
+
     config = MambaHybridConfig(
         d_model=64,
         n_meta=16,
-        l_ans=l_ans,
+        l_ans=81,
         n_steps=2,
         t_cycles=2,
+        M_min=1,
+        M_max=2,
         use_moe=True,
-        vocab_size=128,
+        vocab_size=BYTE_VOCAB_SIZE,
     )
-
-    # Initialize Dataset (load 100 samples per task to train fast on CPU)
-    dataset = MultiTaskDataset(
-        data_dir,
-        max_seq_len=max_seq_len,
-        l_ans=l_ans,
-        max_samples_per_task=100,
-    )
-    if len(dataset) == 0:
-        print(
-            "Error: No datasets found in data/ directory. Please run scripts.download_all_datasets first."
-        )
-        return
-
-    print(f"Loaded total of {len(dataset)} multi-task samples.")
-
-    seed = 42
-    generator = seed_everything(seed)
-    train_indices, validation_indices = deterministic_split_indices(len(dataset), seed)
-    train_set = torch.utils.data.Subset(dataset, train_indices)
-    val_set = torch.utils.data.Subset(dataset, validation_indices)
-
-    train_loader = DataLoader(
-        train_set, batch_size=1, shuffle=True, generator=generator
-    )
-    val_loader = DataLoader(val_set, batch_size=1, shuffle=False)
-
-    # Initialize Unified Model
-    model = UnifiedReasoningLLM(config, vocab_size=128, max_seq_len=max_seq_len).to(
-        device
-    )
+    model = NativeMultiTaskModel(config, grid_size=grid_size).to(device)
+    loaders: dict[TaskName, DataLoader[Any]] = {
+        "SUDOKU": DataLoader(
+            SudokuDataset(sudoku_samples, augment=True), batch_size=8, shuffle=True
+        ),
+        "DIJKSTRA": DataLoader(
+            DijkstraDataset(dijkstra_samples, augment=True), batch_size=8, shuffle=True
+        ),
+        "MAZE": DataLoader(
+            MazeDataset(
+                "data/maze_dryrun.pt",
+                size=grid_size,
+                max_path_len=maze_length,
+            ),
+            batch_size=8,
+            shuffle=True,
+        ),
+        "GSM8K": DataLoader(
+            GSM8KDataset("data/gsm8k_train.jsonl"),
+            batch_size=8,
+            shuffle=True,
+            collate_fn=collate_gsm8k,
+        ),
+    }
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
 
-    epochs = 5
-    print("\nStarting Multi-Task Training Loop...")
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, 6):
         model.train()
-        total_loss = 0.0
-        correct_count = 0
-        total_samples = 0
-
-        for input_ids, target_ids, task_names in train_loader:
-            input_ids, target_ids = input_ids.to(device), target_ids.to(device)
+        totals = {name: 0.0 for name in loaders}
+        counts = {name: 0 for name in loaders}
+        for task_name, batch in round_robin_batches(loaders):
             optimizer.zero_grad()
-
-            logits, bce_probs = model(input_ids, task_names)
-
-            # Accuracy on non-padding tokens
-            preds = logits.argmax(dim=-1)
-            is_correct = exact_match(preds, target_ids, 0)
-            correct_mask = is_correct.float()
-
-            loss = compute_bce_joint_loss(
-                logits, target_ids, bce_probs, correct_mask, alpha=1.0, ignore_index=0
-            )
+            loss, exact = native_task_loss(model, task_name, batch, device)
             loss.backward()  # type: ignore[no-untyped-call]
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-
-            total_loss += loss.item() * input_ids.size(0)
-            correct_count += int(is_correct.sum().item())
-            total_samples += input_ids.size(0)
-
-        train_loss = total_loss / total_samples
-        train_acc = correct_count / total_samples
-
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_samples = 0
-        with torch.no_grad():
-            for input_ids, target_ids, task_names in val_loader:
-                input_ids, target_ids = input_ids.to(device), target_ids.to(device)
-                logits, bce_probs = model(input_ids, task_names)
-                preds = logits.argmax(dim=-1)
-                is_correct = exact_match(preds, target_ids, 0)
-                loss = compute_bce_joint_loss(
-                    logits,
-                    target_ids,
-                    bce_probs,
-                    is_correct.float(),
-                    alpha=1.0,
-                    ignore_index=0,
-                )
-
-                val_loss += loss.item() * input_ids.size(0)
-                val_correct += int(is_correct.sum().item())
-                val_samples += input_ids.size(0)
-
-        val_loss /= val_samples
-        val_acc = val_correct / val_samples
-
-        print(
-            f"Epoch {epoch}/{epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            totals[task_name] += exact
+            counts[task_name] += 1
+        summary = " | ".join(
+            f"{name} Exact: {totals[name] / counts[name]:.4f}" for name in loaders
         )
+        print(f"Epoch {epoch}/5 | {summary}", flush=True)
 
-    # Save checkpoint
     os.makedirs("data", exist_ok=True)
     torch.save(
         {
+            "schema_version": 2,
+            "task": "multitask_native",
             "state_dict": model.state_dict(),
             "config": vars(config),
-            "seed": seed,
-            "validation_indices": validation_indices,
-            "max_seq_len": max_seq_len,
-            "tasks": sorted(dataset.samples[index][2] for index in range(len(dataset))),
+            "task_config": {
+                "tasks": list(loaders),
+                "batching": "homogeneous_round_robin",
+                "target_encodings": {
+                    "SUDOKU": "blank_digits_autoregressive_v2",
+                    "DIJKSTRA": "parents_with_unreachable_v2",
+                    "MAZE": "moves_with_eos_v1",
+                    "GSM8K": "normalized_integer_bytes_v1",
+                },
+            },
         },
         "data/unified_model.pt",
     )
-    print(
-        "\nSuccessfully saved trained Unified Multi-Task model to data/unified_model.pt"
-    )
+
+
+UnifiedReasoningLLM = NativeMultiTaskModel
+
+__all__ = [
+    "NativeMultiTaskModel",
+    "TaskName",
+    "UnifiedReasoningLLM",
+    "native_task_loss",
+    "round_robin_batches",
+]
 
 
 if __name__ == "__main__":
