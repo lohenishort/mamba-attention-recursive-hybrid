@@ -13,3 +13,13 @@ Task-native pipelines are included for:
 - Native multitask: homogeneous round-robin batches through one shared MoE planner and task-specific adapters/printers.
 
 See `TRAINING.md` for commands and checkpoint semantics.
+
+## Native acceleration
+
+The optional Maturin/PyO3 extension accelerates CPU-side batched maze validation, exact-token PTRM consensus, path validation, and Sudoku validation. These helpers retain Python fallbacks when the extension is unavailable. Build the local release extension with:
+
+```bash
+uv run --with maturin maturin develop --release
+```
+
+Autograd and device-resident tensor loops remain in PyTorch. For supported GPUs, enable the optional official `mamba-ssm` Triton scan with `use_cuda_kernels=True`; moving those operations through PyO3 would force host transfers and break the intended tensor execution path.

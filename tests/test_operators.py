@@ -118,6 +118,27 @@ def test_moe_layer_and_block() -> None:
     assert expert_seq[0].weight.grad is not None
 
 
+def test_moe_routes_homogeneous_batch_in_one_expert_call() -> None:
+    from mamba_hybrid.operators import TaskPrefixedMoeLayer
+
+    moe = TaskPrefixedMoeLayer(d_model=8)
+    expert = moe.experts["MAZE"]
+    batch_sizes: list[int] = []
+
+    def record_batch(module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        del module
+        batch_sizes.append(inputs[0].shape[0])
+
+    handle = expert.register_forward_pre_hook(record_batch)
+    try:
+        output = moe(torch.randn(4, 3, 8), task_names=["MAZE"] * 4)
+    finally:
+        handle.remove()
+
+    assert output.shape == (4, 3, 8)
+    assert batch_sizes == [4]
+
+
 def test_non_causal_hybrid_block_is_sequence_reversal_equivariant() -> None:
     config = MambaHybridConfig(d_model=16, n_meta=2, l_ans=2, n_steps=1)
     block = MambaAttentionHybridBlock(config).eval()

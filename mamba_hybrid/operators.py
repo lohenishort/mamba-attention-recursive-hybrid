@@ -72,6 +72,8 @@ class TaskPrefixedMoeLayer(nn.Module):
         unknown = set(task_names) - set(self.experts.keys())
         if unknown:
             raise ValueError(f"unknown task_names: {sorted(unknown)}")
+        if len(set(task_names)) == 1:
+            return cast(torch.Tensor, self.experts[task_names[0]](x))
 
         out_list = []
         for i in range(B):

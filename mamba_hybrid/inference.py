@@ -1,36 +1,33 @@
 import math
 from typing import cast
 
+import numpy as np
+import numpy.typing as npt
 import torch
 
+from mamba_hybrid.evaluation import select_consensus_array
 from mamba_hybrid.model import MambaAttentionHybrid
 
 
 def select_consensus(logits: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
     """Select per-batch logits by exact-token majority, then score ties. [K,B,L,V]."""
+    if logits.ndim != 4:
+        raise ValueError("logits must have shape [rollouts, batch, length, vocab]")
     rollouts, batch_size, _, _ = logits.shape
-    token_ids = logits.argmax(dim=-1)
-    selected: list[torch.Tensor] = []
-    for batch_index in range(batch_size):
-        groups: dict[tuple[int, ...], list[int]] = {}
-        for rollout in range(rollouts):
-            key = tuple(
-                int(token) for token in token_ids[rollout, batch_index].tolist()
-            )
-            groups.setdefault(key, []).append(rollout)
-        largest_size = max(len(indices) for indices in groups.values())
-        eligible = [
-            rollout
-            for indices in groups.values()
-            if len(indices) == largest_size
-            for rollout in indices
-        ]
-        best = max(
-            eligible,
-            key=lambda rollout: float(scores[rollout, batch_index].item()),
-        )
-        selected.append(logits[best, batch_index])
-    return torch.stack(selected, dim=0)
+    if scores.shape != (rollouts, batch_size):
+        raise ValueError("scores must have shape [rollouts, batch]")
+    token_ids = cast(
+        npt.NDArray[np.int64],
+        logits.argmax(dim=-1).detach().cpu().contiguous().numpy(),
+    )
+    score_values = cast(
+        npt.NDArray[np.float32],
+        scores.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy(),
+    )
+    selected = select_consensus_array(token_ids, score_values)
+    rollout_indices = torch.tensor(selected, dtype=torch.long, device=logits.device)
+    batch_indices = torch.arange(batch_size, device=logits.device)
+    return logits[rollout_indices, batch_indices]
 
 
 def ptrm_inference(

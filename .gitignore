@@ -6,6 +6,8 @@ __pycache__/
 build/
 dist/
 native/target/
+native/Cargo.lock
+mamba_hybrid/_native*.so
 *.egg-info/
 
 # Virtual environments
